@@ -1,0 +1,124 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .font-pixel {
+    font-family: 'Press Start 2P', monospace, cursive;
+  }
+  .font-mono-tech {
+    font-family: 'Share Tech Mono', monospace;
+  }
+  .pixelated {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+  }
+}
+
+/* CRT Scanline Effect & Vignette */
+.crt-overlay {
+  background: linear-gradient(
+    rgba(18, 16, 16, 0) 50%, 
+    rgba(0, 0, 0, 0.12) 50%
+  ), linear-gradient(
+    90deg,
+    rgba(255, 0, 0, 0.015),
+    rgba(0, 255, 0, 0.005),
+    rgba(0, 0, 255, 0.015)
+  );
+  background-size: 100% 2px, 2px 100%;
+  pointer-events: none;
+}
+
+@keyframes pulse-red {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.55; }
+}
+
+.animate-siren {
+  animation: pulse-red 0.8s ease-in-out infinite;
+}
+
+@keyframes shake {
+  0% { transform: translate(1px, 1px) rotate(0deg); }
+  10% { transform: translate(-1px, -2px) rotate(-0.5deg); }
+  20% { transform: translate(-3px, 0px) rotate(0.5deg); }
+  30% { transform: translate(3px, 2px) rotate(0deg); }
+  40% { transform: translate(1px, -1px) rotate(0.5deg); }
+  50% { transform: translate(-1px, 2px) rotate(-0.5deg); }
+  60% { transform: translate(-3px, 1px) rotate(0deg); }
+  70% { transform: translate(3px, 1px) rotate(-0.5deg); }
+  80% { transform: translate(-1px, -1px) rotate(0.5deg); }
+  90% { transform: translate(1px, 2px) rotate(0deg); }
+  100% { transform: translate(1px, -2px) rotate(-0.5deg); }
+}
+
+.screen-shake {
+  animation: shake 0.25s cubic-bezier(.36,.07,.19,.97) both;
+}
+
+/* Sci-Fi HUD Animations */
+@keyframes hud-vibrate {
+  0% { transform: translate(0, 0); }
+  20% { transform: translate(-2px, 1.5px); }
+  40% { transform: translate(2px, -1.5px); }
+  60% { transform: translate(-1.5px, -1px); }
+  80% { transform: translate(1.5px, 1px); }
+  100% { transform: translate(0, 0); }
+}
+
+.animate-hud-vibrate {
+  animation: hud-vibrate 0.14s ease-in-out infinite;
+}
+
+@keyframes hud-armor-pulse {
+  0% {
+    box-shadow: 0 0 4px rgba(6, 182, 212, 0.4), inset 0 0 4px rgba(6, 182, 212, 0.2);
+    border-color: rgba(6, 182, 212, 0.8);
+  }
+  50% {
+    box-shadow: 0 0 22px rgba(6, 182, 212, 0.9), inset 0 0 14px rgba(6, 182, 212, 0.5);
+    border-color: #22d3ee;
+    transform: scale(1.025);
+  }
+  100% {
+    box-shadow: 0 0 4px rgba(6, 182, 212, 0.4), inset 0 0 4px rgba(6, 182, 212, 0.2);
+    border-color: rgba(6, 182, 212, 0.8);
+  }
+}
+
+.animate-armor-glow {
+  animation: hud-armor-pulse 0.6s ease-in-out infinite;
+}
+
+@keyframes sci-fi-hud-sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(200%); }
+}
+
+.animate-laser-sweep {
+  animation: sci-fi-hud-sweep 2.2s linear infinite;
+}
+
+@keyframes holographic-flicker {
+  0%, 100% { opacity: 0.95; }
+  50% { opacity: 0.8; }
+  75% { opacity: 1; }
+  85% { opacity: 0.85; }
+}
+
+.animate-holo {
+  animation: holographic-flicker 3s ease-in-out infinite;
+}
+
+/* Chamfered Sci-Fi Cut Corners */
+.sci-fi-cut-tl-br {
+  clip-path: polygon(8px 0%, 100% 0%, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0% 100%, 0% 8px);
+}
+
+.sci-fi-cut-corners {
+  clip-path: polygon(6px 0%, calc(100% - 6px) 0%, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0% calc(100% - 6px), 0% 6px);
+}
+
+.sci-fi-panel-header {
+  clip-path: polygon(0 0, calc(100% - 10px) 0, 100% 10px, 100% 100%, 0 100%);
+}
+

@@ -1,0 +1,6 @@
+{
+  "name": "KILL-O-METER - Retro 2.5D FPS",
+  "description": "A brutal, high-octane 90s retro 2.5D raycasting FPS featuring fast dash mobility, 5 devastating weapons, visceral gib physics, reactive HUD, synthesized dark synth soundtrack, and an escalating Kill-O-Meter leading to an epic Boss Lockdown.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
