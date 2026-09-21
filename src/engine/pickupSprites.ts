@@ -752,5 +752,66 @@ export function generateAllPickupSprites(
     ctx.fillRect(43, 38, 3, 2);
   });
 
+  // 13: Chrono-Haste Relic / Infinite Dash Artifact (Secret Vault Powerup)
+  items['infinite_dash_relic'] = createCanvas(size, size, (ctx) => {
+    // Floor Contact Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.beginPath();
+    ctx.ellipse(32, 57, 22, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Radiant Cyan / Amber Temporal Forcefield
+    const fieldGrad = ctx.createRadialGradient(32, 30, 2, 32, 30, 26);
+    fieldGrad.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+    fieldGrad.addColorStop(0.2, '#38bdf8');
+    fieldGrad.addColorStop(0.5, '#0284c7');
+    fieldGrad.addColorStop(0.75, 'rgba(234, 179, 8, 0.4)');
+    fieldGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+    ctx.fillStyle = fieldGrad;
+    ctx.beginPath();
+    ctx.arc(32, 30, 26, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Outer Chronometer Brass Ring
+    ctx.strokeStyle = '#eab308';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(32, 30, 22, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Inner Counter-Rotating Temporal Ring
+    ctx.strokeStyle = '#38bdf8';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.ellipse(32, 30, 18, 14, Math.PI / 4, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Radiant Core Hourglass Prism (Center)
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(26, 20);
+    ctx.lineTo(38, 20);
+    ctx.lineTo(32, 30);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(32, 30);
+    ctx.lineTo(38, 40);
+    ctx.lineTo(26, 40);
+    ctx.closePath();
+    ctx.fill();
+
+    ctx.fillStyle = '#38bdf8';
+    ctx.fillRect(30, 28, 4, 4);
+
+    // Crackling Cyan Lightning Sparks
+    ctx.fillStyle = '#fef08a';
+    ctx.fillRect(18, 22, 3, 2);
+    ctx.fillRect(44, 24, 2, 3);
+    ctx.fillRect(20, 38, 2, 3);
+    ctx.fillRect(42, 36, 3, 2);
+  });
+
   return items;
 }

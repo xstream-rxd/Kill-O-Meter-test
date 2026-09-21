@@ -1,4 +1,4 @@
-import { Player, Enemy, Projectile, PickupItem, LootChest, ShellCasing, SteamParticle } from '../types';
+import { Player, Enemy, Projectile, PickupItem, LootChest, ShellCasing, SteamParticle, SecretArea, AirlockDoor } from '../types';
 import { TextureManager } from './textures';
 import { ParticleSystem } from './particleSystem';
 
@@ -15,6 +15,9 @@ export interface RenderContext {
   projectiles: Projectile[];
   pickups: PickupItem[];
   chests?: LootChest[];
+  secrets?: SecretArea[];
+  airlockDoors?: AirlockDoor[];
+  airlockAnimProgress?: number;
   particles: ParticleSystem;
   flashLight: number; // 0 to 1
   flashColor?: string;
@@ -23,6 +26,7 @@ export interface RenderContext {
   time: number;
   exitPos?: { x: number; y: number };
   exitUnlocked?: boolean;
+  fov?: number; // Field of View in radians (~1.05 to 1.3)
 }
 
 interface SpriteRenderItem {
@@ -63,6 +67,13 @@ export class RaycasterEngine {
   private curTime = 0;
   private curStageNumber = 1;
 
+  // Cached door maps to eliminate garbage collection allocations per frame
+  private secretDoorMap = new Map<number, SecretArea>();
+  private airlockDoorMap = new Map<number, number>();
+  private wallDecalMap = new Map<number, any[]>();
+  private relevantFloorLights: Array<{ x: number; y: number; radius: number; intensity: number; r: number; g: number; b: number }> = [];
+  private wallDecalsSlice: Array<{ colorR: number; colorG: number; colorB: number; opacity: number; yStart: number; yEnd: number }> = [];
+
   public render(rc: RenderContext) {
     const { ctx, width, height, player, grid, flashLight, isLockdown, time, stageNumber = 1 } = rc;
 
@@ -76,9 +87,32 @@ export class RaycasterEngine {
     }
 
     const buf = this.screenBuffer!;
-    const fov = 1.15; // ~66 degree Field of View
+    const fov = rc.fov || 1.15; // Field of View (~66 degrees default)
     const halfFov = fov / 2;
     const halfHeight = Math.round(height / 2 + (player.pitch || 0));
+
+    // Secret Door Receding Animations:
+    // Build quick lookup for secret doors actively lowering/sinking into the floor
+    this.secretDoorMap.clear();
+    if (rc.secrets) {
+      for (let si = 0; si < rc.secrets.length; si++) {
+        const sec = rc.secrets[si];
+        if (sec.animating && sec.animOffset !== undefined) {
+          this.secretDoorMap.set(sec.doorY * 1000 + sec.doorX, sec);
+        }
+      }
+    }
+
+    // Airlock Door Receding Animations:
+    this.airlockDoorMap.clear();
+    if (rc.airlockDoors) {
+      for (let di = 0; di < rc.airlockDoors.length; di++) {
+        const ad = rc.airlockDoors[di];
+        if (ad.animOffset !== undefined && ad.animOffset > 0) {
+          this.airlockDoorMap.set(ad.y * 1000 + ad.x, ad.animOffset);
+        }
+      }
+    }
 
     // Direction & Camera Plane Vectors
     const dirX = Math.cos(player.angle);
@@ -141,7 +175,7 @@ export class RaycasterEngine {
       }
     }
 
-    // Exit Teleporter Gateway
+    // Exit Teleporter Gateway (Dynamic atmospheric light - ONLY active when exit unlocked after boss defeat)
     if (rc.exitPos && rc.exitUnlocked) {
       const pulse = 0.9 + Math.sin(time * 6) * 0.3;
       dynamicLights.push({ x: rc.exitPos.x, y: rc.exitPos.y, radius: 6.5, intensity: pulse, r: 16, g: 185, b: 129 });
@@ -153,6 +187,44 @@ export class RaycasterEngine {
         const c = rc.chests[i];
         if (!c.opened) {
           dynamicLights.push({ x: c.x, y: c.y, radius: 2.5, intensity: 0.45, r: 245, g: 158, b: 11 });
+        }
+      }
+    }
+
+    // Active Secret Doors Golden Amber Glow
+    if (rc.secrets) {
+      for (let i = 0; i < rc.secrets.length; i++) {
+        const sec = rc.secrets[i];
+        if (sec.animating || (sec.revealed && sec.animOffset !== undefined && sec.animOffset < 1.0)) {
+          const pulse = 0.85 + Math.sin(time * 25) * 0.2;
+          dynamicLights.push({
+            x: sec.doorX + 0.5,
+            y: sec.doorY + 0.5,
+            radius: 4.2,
+            intensity: 0.95 * pulse,
+            r: 250,
+            g: 204,
+            b: 21,
+          });
+        }
+      }
+    }
+
+    // Active Airlock Doors Cyan Decompression Glow
+    if (rc.airlockDoors) {
+      for (let i = 0; i < rc.airlockDoors.length; i++) {
+        const ad = rc.airlockDoors[i];
+        if (ad.animOffset !== undefined && ad.animOffset > 0 && ad.animOffset < 1.0) {
+          const pulse = 0.85 + Math.sin(time * 30) * 0.18;
+          dynamicLights.push({
+            x: ad.x + 0.5,
+            y: ad.y + 0.5,
+            radius: 4.8,
+            intensity: 1.0 * pulse,
+            r: 56,
+            g: 189,
+            b: 248,
+          });
         }
       }
     }
@@ -211,12 +283,12 @@ export class RaycasterEngine {
       const ceilRowOffset = ceilY >= 0 ? ceilY * width : -1;
 
       // Pre-filter dynamic lights that can intersect this row distance
-      const relevantLights: typeof dynamicLights = [];
+      this.relevantFloorLights.length = 0;
       for (let li = 0; li < dynamicLights.length; li++) {
         const dl = dynamicLights[li];
         const distToPlayer = Math.hypot(dl.x - player.x, dl.y - player.y);
         if (Math.abs(distToPlayer - rowDist) <= dl.radius * 1.5) {
-          relevantLights.push(dl);
+          this.relevantFloorLights.push(dl);
         }
       }
 
@@ -246,8 +318,8 @@ export class RaycasterEngine {
         let floorDynG = 0;
         let floorDynB = 0;
 
-        for (let li = 0; li < relevantLights.length; li++) {
-          const dl = relevantLights[li];
+        for (let li = 0; li < this.relevantFloorLights.length; li++) {
+          const dl = this.relevantFloorLights[li];
           const dlDx = floorX - dl.x;
           const dlDy = floorY - dl.y;
           const dlDistSq = dlDx * dlDx + dlDy * dlDy;
@@ -321,19 +393,21 @@ export class RaycasterEngine {
     // 4. ROCK-SOLID DDA RAYCASTING & PERSPECTIVE WALL RENDERING
     // -------------------------------------------------------------
     // Pre-index wall decals by cell and side to eliminate up to 192,000 array iterations per frame
-    const wallDecalMap = new Map<number, typeof rc.particles.wallDecals>();
+    this.wallDecalMap.clear();
     if (rc.particles.wallDecals.length > 0) {
       for (let di = 0; di < rc.particles.wallDecals.length; di++) {
         const decal = rc.particles.wallDecals[di];
         const cellKey = (decal.mapY * 1000 + decal.mapX) * 2 + decal.side;
-        let list = wallDecalMap.get(cellKey);
+        let list = this.wallDecalMap.get(cellKey);
         if (!list) {
           list = [];
-          wallDecalMap.set(cellKey, list);
+          this.wallDecalMap.set(cellKey, list);
         }
         list.push(decal);
       }
     }
+
+    const flashColor = rc.flashLightColor || { r: 255, g: 215, b: 120 };
 
     for (let x = 0; x < width; x++) {
       const cameraX = (2 * x) / width - 1;
@@ -375,6 +449,20 @@ export class RaycasterEngine {
       let ddaSteps = 0;
       const maxDdaSteps = 96; // Extended DDA depth for massive 64x64 maps
 
+      interface LoweringDoorHit {
+        mapX: number;
+        mapY: number;
+        side: 0 | 1;
+        wallType: number;
+        perpWallDist: number;
+        animOffset: number;
+        seamType: 'secret' | 'airlock';
+        stepX: number;
+        stepY: number;
+      }
+
+      let doorHit: LoweringDoorHit | null = null;
+
       while (hit === 0 && ddaSteps < maxDdaSteps) {
         ddaSteps++;
         if (sideDistX < sideDistY) {
@@ -388,9 +476,52 @@ export class RaycasterEngine {
         }
 
         if (mapY >= 0 && mapY < grid.length && mapX >= 0 && mapX < grid[0].length) {
-          if (grid[mapY][mapX] > 0) {
+          const cellVal = grid[mapY][mapX];
+          if (cellVal > 0) {
+            const cellKey = mapY * 1000 + mapX;
+            const sec = this.secretDoorMap.get(cellKey);
+            const airlockOffset = this.airlockDoorMap.get(cellKey);
+
+            let isLowering = false;
+            let offset = 0;
+            let seam: 'secret' | 'airlock' = 'secret';
+
+            if (sec && sec.animOffset !== undefined) {
+              isLowering = true;
+              offset = sec.animOffset;
+              seam = 'secret';
+            } else if (airlockOffset !== undefined && airlockOffset > 0) {
+              isLowering = true;
+              offset = airlockOffset;
+              seam = 'airlock';
+            }
+
+            if (isLowering) {
+              if (offset >= 1.0) {
+                // Sunk all the way into the floor: ray passes through unobstructed!
+                continue;
+              }
+              if (!doorHit) {
+                const dist = side === 0 ? (sideDistX - deltaDistX) : (sideDistY - deltaDistY);
+                doorHit = {
+                  mapX,
+                  mapY,
+                  side,
+                  wallType: cellVal,
+                  perpWallDist: Math.max(0.08, dist),
+                  animOffset: offset,
+                  seamType: seam,
+                  stepX,
+                  stepY,
+                };
+              }
+              // Ray continues through the lowering door opening to find the interior background wall!
+              continue;
+            }
+
+            // Solid normal wall
             hit = 1;
-            wallType = grid[mapY][mapX];
+            wallType = cellVal;
           }
         } else {
           hit = 1;
@@ -403,171 +534,47 @@ export class RaycasterEngine {
       if (!isFinite(perpWallDist) || perpWallDist < 0.08) perpWallDist = 0.08;
 
       // 1D Z-Buffer for sprite billboarding occlusion
-      this.zBuffer[x] = perpWallDist;
+      this.zBuffer[x] = (doorHit && doorHit.animOffset < 0.45) ? doorHit.perpWallDist : perpWallDist;
 
-      // True unclipped projected wall coordinates
-      const lineHeight = Math.round(height / perpWallDist);
-      const unclippedStart = -lineHeight / 2 + halfHeight;
-      const drawStart = Math.max(0, Math.floor(unclippedStart));
-      const drawEnd = Math.min(height - 1, Math.floor(lineHeight / 2 + halfHeight));
+      // True unclipped projected background wall coordinates
+      const bgLineHeight = Math.round(height / perpWallDist);
+      const bgUnclippedStart = -bgLineHeight / 2 + halfHeight;
+      const bgDrawStart = Math.max(0, Math.floor(bgUnclippedStart));
+      const bgDrawEnd = Math.min(height - 1, Math.floor(bgLineHeight / 2 + halfHeight));
 
-      // Wall hit coordinate along wall surface
-      let wallX = side === 0 ? player.y + perpWallDist * rayDirY : player.x + perpWallDist * rayDirX;
-      wallX -= Math.floor(wallX);
+      // 1. Render Background Wall Slice
+      this.renderWallSlice(
+        buf, width, height, x,
+        mapX, mapY, side, wallType, perpWallDist,
+        rayDirX, rayDirY, stepX, stepY,
+        player.x, player.y, halfHeight,
+        bgDrawStart, bgDrawEnd, bgLineHeight, bgUnclippedStart,
+        null, 0,
+        time, texSize, fogColorR, fogColorG, fogColorB,
+        dynamicLights, flashLight, flashColor, isLockdown
+      );
 
-      // Correct texture column orientation
-      let texX = Math.floor(wallX * texSize);
-      if (side === 0 && rayDirX > 0) texX = texSize - texX - 1;
-      if (side === 1 && rayDirY < 0) texX = texSize - texX - 1;
-      texX = Math.max(0, Math.min(texSize - 1, texX));
+      // 2. If ray passed through a lowering door, render the sinking door slab in front!
+      if (doorHit) {
+        const doorLineHeight = Math.round(height / doorHit.perpWallDist);
+        const doorUnclippedStart = -doorLineHeight / 2 + halfHeight;
+        const doorTop = Math.floor(doorUnclippedStart + doorLineHeight * doorHit.animOffset);
+        const doorFloor = Math.floor(doorLineHeight / 2 + halfHeight);
+        const doorDrawStart = Math.max(0, doorTop);
+        const doorDrawEnd = Math.min(height - 1, doorFloor);
 
-      // Select pre-rasterized 32-bit wall texture (with frame animation support)
-      const texIdx = Math.max(0, Math.min(this.textures.wallPixels.length - 1, wallType - 1));
-      const wallPixels = this.textures.getWallPixels(texIdx, time);
-
-      // Directional 3D Shading for depth perception (East=key light, West=fill, South/North=accent)
-      let dirShade = 1.0;
-      if (side === 0) {
-        dirShade = rayDirX > 0 ? 0.94 : 1.0;
-      } else {
-        dirShade = rayDirY > 0 ? 0.78 : 0.86;
-      }
-
-      // Distance depth fog factor
-      let fogFactor = 1.0 / (1.0 + perpWallDist * 0.085 + (perpWallDist * perpWallDist) * 0.009);
-      fogFactor = Math.max(0.04, Math.min(1.0, fogFactor));
-
-      // Hit world coordinates for dynamic point lights
-      const hitWorldX = side === 0 ? (mapX + (stepX < 0 ? 1 : 0)) : (player.x + perpWallDist * rayDirX);
-      const hitWorldY = side === 1 ? (mapY + (stepY < 0 ? 1 : 0)) : (player.y + perpWallDist * rayDirY);
-
-      let dynR = 0;
-      let dynG = 0;
-      let dynB = 0;
-
-      // Nearby dynamic point lights (plasma bolts, rockets, portal, barrels)
-      for (let li = 0; li < dynamicLights.length; li++) {
-        const dl = dynamicLights[li];
-        const dlDx = hitWorldX - dl.x;
-        const dlDy = hitWorldY - dl.y;
-        const dlDistSq = dlDx * dlDx + dlDy * dlDy;
-        const dlRadSq = dl.radius * dl.radius;
-        if (dlDistSq < dlRadSq) {
-          const distNorm = Math.sqrt(dlDistSq) / dl.radius;
-          const att = Math.max(0, (1.0 - distNorm * distNorm)) * dl.intensity;
-          dynR += dl.r * att;
-          dynG += dl.g * att;
-          dynB += dl.b * att;
+        if (doorDrawStart <= doorDrawEnd) {
+          this.renderWallSlice(
+            buf, width, height, x,
+            doorHit.mapX, doorHit.mapY, doorHit.side, doorHit.wallType, doorHit.perpWallDist,
+            rayDirX, rayDirY, doorHit.stepX, doorHit.stepY,
+            player.x, player.y, halfHeight,
+            doorDrawStart, doorDrawEnd, doorLineHeight, doorUnclippedStart,
+            doorHit.seamType, doorHit.animOffset,
+            time, texSize, fogColorR, fogColorG, fogColorB,
+            dynamicLights, flashLight, flashColor, isLockdown
+          );
         }
-      }
-
-      // Muzzle flash subtle wall illumination (soft close-range glow without room blinding)
-      if (flashLight > 0) {
-        const fColor = rc.flashLightColor || { r: 255, g: 215, b: 120 };
-        const flashAtt = flashLight * Math.max(0, 1 - perpWallDist / 3.5) * 0.20;
-        dynR += fColor.r * flashAtt;
-        dynG += fColor.g * flashAtt;
-        dynB += fColor.b * flashAtt;
-      }
-
-      // Emergency lockdown warning sirens
-      if (isLockdown) {
-        const sirenPulse = (Math.sin(time * 7) + 1) * 0.5;
-        dynR += sirenPulse * 45;
-      }
-
-      // Wall Decals (blood splatters and scorch marks)
-      const cellKey = (mapY * 1000 + mapX) * 2 + side;
-      const activeDecals = wallDecalMap.get(cellKey);
-      let wallDecalsOnSlice: { colorR: number; colorG: number; colorB: number; opacity: number; yStart: number; yEnd: number }[] | null = null;
-
-      if (activeDecals && activeDecals.length > 0) {
-        for (let di = 0; di < activeDecals.length; di++) {
-          const decal = activeDecals[di];
-          const diff = Math.abs(wallX - decal.wallOffset);
-          if (diff < decal.size / 2) {
-            const cy = unclippedStart + lineHeight * decal.wallZ;
-            const h2 = Math.max(2, (lineHeight * decal.size) / 2);
-            const decalColor = decal.color || '';
-            const isBlood = decal.type === 'blood_splat' || decalColor.includes('99') || decalColor.includes('dc') || decalColor.includes('88') || decalColor.includes('red');
-            let opacity = 0.75;
-            if (decal.life !== undefined && decal.maxLife !== undefined && decal.life > decal.maxLife - 1.0) {
-              opacity *= Math.max(0, (decal.maxLife - decal.life) / 1.0);
-            }
-            if (opacity > 0.02) {
-              if (!wallDecalsOnSlice) wallDecalsOnSlice = [];
-              wallDecalsOnSlice.push({
-                colorR: isBlood ? 165 : 20,
-                colorG: isBlood ? 12 : 20,
-                colorB: isBlood ? 12 : 20,
-                opacity,
-                yStart: Math.floor(cy - h2),
-                yEnd: Math.floor(cy + h2),
-              });
-            }
-          }
-        }
-      }
-
-      // Render wall column pixels directly into 32-bit screen buffer with sub-texel smooth vertical filtering
-      const sliceHeight = drawEnd - drawStart + 1;
-      const invLineHeight = 1.0 / lineHeight;
-      const texStep = texSize * invLineHeight;
-      let curTexY = (drawStart - unclippedStart) * texStep;
-
-      for (let y = drawStart; y <= drawEnd; y++, curTexY += texStep) {
-        const texY0 = Math.floor(curTexY) & (texSize - 1);
-        const fracY = curTexY - Math.floor(curTexY);
-        const texY1 = (texY0 + 1) & (texSize - 1);
-
-        let r: number, g: number, b: number;
-        if (wallPixels) {
-          const raw0 = wallPixels[(texY0 << 6) | texX];
-          const raw1 = wallPixels[(texY1 << 6) | texX];
-          const r0 = raw0 & 0xff;
-          const g0 = (raw0 >> 8) & 0xff;
-          const b0 = (raw0 >> 16) & 0xff;
-          const r1 = raw1 & 0xff;
-          const g1 = (raw1 >> 8) & 0xff;
-          const b1 = (raw1 >> 16) & 0xff;
-          r = (r0 * (1 - fracY) + r1 * fracY) | 0;
-          g = (g0 * (1 - fracY) + g1 * fracY) | 0;
-          b = (b0 * (1 - fracY) + b1 * fracY) | 0;
-        } else {
-          r = 0x33; g = 0x44; b = 0x55;
-        }
-
-        // Ambient Occlusion contact shadow near ceiling and floor junctions
-        let ao = 1.0;
-        const distEdge = Math.min(y - drawStart, drawEnd - y);
-        if (distEdge < 10 && sliceHeight > 18) {
-          ao = 0.52 + (distEdge / 10) * 0.48;
-        }
-
-        // Decal overlay with smooth alpha blending
-        if (wallDecalsOnSlice) {
-          for (let di = 0; di < wallDecalsOnSlice.length; di++) {
-            const d = wallDecalsOnSlice[di];
-            if (y >= d.yStart && y <= d.yEnd) {
-              const op = d.opacity;
-              r = (r * (1 - op) + d.colorR * op) | 0;
-              g = (g * (1 - op) + d.colorG * op) | 0;
-              b = (b * (1 - op) + d.colorB * op) | 0;
-            }
-          }
-        }
-
-        // Directional shading + AO + Dynamic Point Lights
-        const litR = Math.min(255, r * dirShade * ao + dynR);
-        const litG = Math.min(255, g * dirShade * ao + dynG);
-        const litB = Math.min(255, b * dirShade * ao + dynB);
-
-        // Exponential distance depth fog
-        const finalR = (litR * fogFactor + fogColorR * (1 - fogFactor)) | 0;
-        const finalG = (litG * fogFactor + fogColorG * (1 - fogFactor)) | 0;
-        const finalB = (litB * fogFactor + fogColorB * (1 - fogFactor)) | 0;
-
-        buf[y * width + x] = 0xff000000 | (finalB << 16) | (finalG << 8) | finalR;
       }
     }
 
@@ -595,6 +602,207 @@ export class RaycasterEngine {
     // 8. CINEMATIC VIGNETTE & LENS DARKENING
     // -------------------------------------------------------------
     this.renderCinematicVignette(ctx, width, height, isLockdown);
+  }
+
+  // --- SUB-TEXEL WALL SLICE RASTERIZER & LIGHTING COMPOSITOR ---
+  private renderWallSlice(
+    buf: Uint32Array,
+    width: number,
+    height: number,
+    x: number,
+    mapX: number,
+    mapY: number,
+    side: 0 | 1,
+    wallType: number,
+    perpWallDist: number,
+    rayDirX: number,
+    rayDirY: number,
+    stepX: number,
+    stepY: number,
+    playerX: number,
+    playerY: number,
+    halfHeight: number,
+    drawStart: number,
+    drawEnd: number,
+    lineHeight: number,
+    unclippedStart: number,
+    doorSeamType: 'secret' | 'airlock' | null,
+    animSinkFraction: number,
+    time: number,
+    texSize: number,
+    fogColorR: number,
+    fogColorG: number,
+    fogColorB: number,
+    dynamicLights: Array<{ x: number; y: number; radius: number; intensity: number; r: number; g: number; b: number }>,
+    flashLight: number,
+    flashColor: { r: number; g: number; b: number },
+    isLockdown: boolean
+  ) {
+    if (drawStart > drawEnd || drawEnd < 0 || drawStart >= height) return;
+
+    // Hit coordinate along wall surface
+    let wallX = side === 0 ? playerY + perpWallDist * rayDirY : playerX + perpWallDist * rayDirX;
+    wallX -= Math.floor(wallX);
+
+    // Correct texture column orientation
+    let texX = Math.floor(wallX * texSize);
+    if (side === 0 && rayDirX > 0) texX = texSize - texX - 1;
+    if (side === 1 && rayDirY < 0) texX = texSize - texX - 1;
+    texX = Math.max(0, Math.min(texSize - 1, texX));
+
+    // Select pre-rasterized 32-bit wall texture
+    const texIdx = Math.max(0, Math.min(this.textures.wallPixels.length - 1, wallType - 1));
+    const wallPixels = this.textures.getWallPixels(texIdx, time);
+
+    // Directional 3D Shading for depth perception
+    const dirShade = side === 0 ? (rayDirX > 0 ? 0.94 : 1.0) : (rayDirY > 0 ? 0.78 : 0.86);
+
+    // Distance depth fog factor
+    let fogFactor = 1.0 / (1.0 + perpWallDist * 0.085 + (perpWallDist * perpWallDist) * 0.009);
+    fogFactor = Math.max(0.04, Math.min(1.0, fogFactor));
+
+    // Hit world coordinates for dynamic point lights
+    const hitWorldX = side === 0 ? (mapX + (stepX < 0 ? 1 : 0)) : (playerX + perpWallDist * rayDirX);
+    const hitWorldY = side === 1 ? (mapY + (stepY < 0 ? 1 : 0)) : (playerY + perpWallDist * rayDirY);
+
+    let dynR = 0;
+    let dynG = 0;
+    let dynB = 0;
+
+    for (let li = 0; li < dynamicLights.length; li++) {
+      const dl = dynamicLights[li];
+      const dlDx = hitWorldX - dl.x;
+      const dlDy = hitWorldY - dl.y;
+      const dlDistSq = dlDx * dlDx + dlDy * dlDy;
+      const dlRadSq = dl.radius * dl.radius;
+
+      if (dlDistSq < dlRadSq) {
+        const distNorm = Math.sqrt(dlDistSq) / dl.radius;
+        const att = Math.max(0, (1.0 - distNorm * distNorm)) * dl.intensity;
+        dynR += dl.r * att;
+        dynG += dl.g * att;
+        dynB += dl.b * att;
+      }
+    }
+
+    if (flashLight > 0) {
+      const flashAtt = flashLight * Math.max(0, 1 - perpWallDist / 3.5) * 0.20;
+      dynR += flashColor.r * flashAtt;
+      dynG += flashColor.g * flashAtt;
+      dynB += flashColor.b * flashAtt;
+    }
+
+    if (isLockdown) {
+      const sirenPulse = (Math.sin(time * 7) + 1) * 0.5;
+      dynR += sirenPulse * 45;
+    }
+
+    // Wall Decals
+    const cellKey = (mapY * 1000 + mapX) * 2 + side;
+    const activeDecals = this.wallDecalMap.get(cellKey);
+    this.wallDecalsSlice.length = 0;
+
+    if (activeDecals && activeDecals.length > 0) {
+      for (let di = 0; di < activeDecals.length; di++) {
+        const decal = activeDecals[di];
+        const diff = Math.abs(wallX - decal.wallOffset);
+        if (diff < decal.size / 2) {
+          const cy = unclippedStart + lineHeight * decal.wallZ;
+          const h2 = Math.max(2, (lineHeight * decal.size) / 2);
+          const decalColor = decal.color || '';
+          const isBlood = decal.type === 'blood_splat' || decalColor.includes('99') || decalColor.includes('dc') || decalColor.includes('88') || decalColor.includes('red');
+          let opacity = 0.75;
+          if (decal.life !== undefined && decal.maxLife !== undefined && decal.life > decal.maxLife - 1.0) {
+            opacity *= Math.max(0, (decal.maxLife - decal.life) / 1.0);
+          }
+          if (opacity > 0.02) {
+            this.wallDecalsSlice.push({
+              colorR: isBlood ? 165 : 20,
+              colorG: isBlood ? 12 : 20,
+              colorB: isBlood ? 12 : 20,
+              opacity,
+              yStart: Math.floor(cy - h2),
+              yEnd: Math.floor(cy + h2),
+            });
+          }
+        }
+      }
+    }
+
+    const sliceHeight = drawEnd - drawStart + 1;
+    const invLineHeight = 1.0 / lineHeight;
+    const texStep = texSize * invLineHeight;
+    const effectiveWallOrigin = doorSeamType ? (unclippedStart + lineHeight * animSinkFraction) : unclippedStart;
+    let curTexY = (drawStart - effectiveWallOrigin) * texStep;
+
+    for (let y = drawStart; y <= drawEnd; y++, curTexY += texStep) {
+      const texY0 = Math.floor(curTexY) & (texSize - 1);
+      const fracY = curTexY - Math.floor(curTexY);
+      const texY1 = (texY0 + 1) & (texSize - 1);
+
+      let r: number, g: number, b: number;
+      if (wallPixels) {
+        const raw0 = wallPixels[(texY0 << 6) | texX];
+        const raw1 = wallPixels[(texY1 << 6) | texX];
+        const r0 = raw0 & 0xff;
+        const g0 = (raw0 >> 8) & 0xff;
+        const b0 = (raw0 >> 16) & 0xff;
+        const r1 = raw1 & 0xff;
+        const g1 = (raw1 >> 8) & 0xff;
+        const b1 = (raw1 >> 16) & 0xff;
+        r = (r0 * (1 - fracY) + r1 * fracY) | 0;
+        g = (g0 * (1 - fracY) + g1 * fracY) | 0;
+        b = (b0 * (1 - fracY) + b1 * fracY) | 0;
+      } else {
+        r = 0x33; g = 0x44; b = 0x55;
+      }
+
+      // Ambient Occlusion contact shadow near ceiling and floor junctions
+      let ao = 1.0;
+      const distEdge = Math.min(y - drawStart, drawEnd - y);
+      if (distEdge < 12 && sliceHeight > 18) {
+        ao = 0.50 + (distEdge / 12) * 0.50;
+      }
+
+      // Decal overlay with smooth alpha blending
+      if (this.wallDecalsSlice.length > 0) {
+        for (let di = 0; di < this.wallDecalsSlice.length; di++) {
+          const d = this.wallDecalsSlice[di];
+          if (y >= d.yStart && y <= d.yEnd) {
+            const op = d.opacity;
+            r = (r * (1 - op) + d.colorR * op) | 0;
+            g = (g * (1 - op) + d.colorG * op) | 0;
+            b = (b * (1 - op) + d.colorB * op) | 0;
+          }
+        }
+      }
+
+      // Glowing Hydraulic Laser Seam / Mechanical Rim Highlight along top edge of descending door slab
+      if (doorSeamType && (y - drawStart) <= 3) {
+        const seamProgress = 1.0 - (y - drawStart) / 3.0;
+        if (doorSeamType === 'secret') {
+          r = Math.min(255, r + Math.round(230 * seamProgress));
+          g = Math.min(255, g + Math.round(190 * seamProgress));
+          b = Math.min(255, b + Math.round(30 * seamProgress));
+        } else if (doorSeamType === 'airlock') {
+          r = Math.min(255, r + Math.round(40 * seamProgress));
+          g = Math.min(255, g + Math.round(190 * seamProgress));
+          b = Math.min(255, b + Math.round(250 * seamProgress));
+        }
+      }
+
+      // Directional shading + AO + Dynamic Point Lights
+      const litR = Math.min(255, r * dirShade * ao + dynR);
+      const litG = Math.min(255, g * dirShade * ao + dynG);
+      const litB = Math.min(255, b * dirShade * ao + dynB);
+
+      // Exponential distance depth fog
+      const finalR = (litR * fogFactor + fogColorR * (1 - fogFactor)) | 0;
+      const finalG = (litG * fogFactor + fogColorG * (1 - fogFactor)) | 0;
+      const finalB = (litB * fogFactor + fogColorB * (1 - fogFactor)) | 0;
+
+      buf[y * width + x] = 0xff000000 | (finalB << 16) | (finalG << 8) | finalR;
+    }
   }
 
   // --- ATMOSPHERIC AIRBORNE DUST PARTICLES & HEAT EMBERS ---
@@ -851,7 +1059,7 @@ export class RaycasterEngine {
       });
     }
 
-    // Exit Teleporter Gateway Pillar (when unlocked)
+    // Exit Teleporter Gateway Pillar (rendered ONLY when exit is unlocked / boss is defeated)
     if (rc.exitPos && rc.exitUnlocked) {
       const dx = rc.exitPos.x - player.x;
       const dy = rc.exitPos.y - player.y;
@@ -862,7 +1070,7 @@ export class RaycasterEngine {
         z: 0,
         distSq: dx * dx + dy * dy,
         scale: 1.1,
-        data: rc.exitPos,
+        data: { ...rc.exitPos, unlocked: true },
       });
     }
 
@@ -1095,6 +1303,7 @@ export class RaycasterEngine {
           width
         );
       } else if (item.type === 'portal') {
+        const isUnlocked = (item.data as { unlocked?: boolean })?.unlocked ?? true;
         this.drawPortalBillboard(
           ctx,
           drawStartX,
@@ -1105,7 +1314,8 @@ export class RaycasterEngine {
           spriteWidth,
           spriteHeight,
           transformY,
-          width
+          width,
+          isUnlocked
         );
       }
     }
@@ -1115,7 +1325,13 @@ export class RaycasterEngine {
 
   public getEnemyFrame(enemy: Enemy): HTMLCanvasElement {
     let canvases = this.textures.enemyCanvases[enemy.type] || this.textures.enemyCanvases['grunt'];
-    if (enemy.isUltraBoss && this.textures.ultraBossCanvases && this.textures.ultraBossCanvases.length > 0) {
+    if (enemy.type === 'boss') {
+      if (enemy.stageBossId && this.textures.stageBossCanvases[enemy.stageBossId]) {
+        canvases = this.textures.stageBossCanvases[enemy.stageBossId];
+      } else if (enemy.isUltraBoss && this.textures.ultraBossCanvases && this.textures.ultraBossCanvases.length > 0) {
+        canvases = this.textures.ultraBossCanvases;
+      }
+    } else if (enemy.isUltraBoss && this.textures.ultraBossCanvases && this.textures.ultraBossCanvases.length > 0) {
       canvases = this.textures.ultraBossCanvases;
     }
     let frameIdx = 0;
@@ -1134,6 +1350,8 @@ export class RaycasterEngine {
       frameIdx = Math.min(4, canvases.length - 1);
     } else if (enemy.state === 'attack') {
       frameIdx = Math.min(2, canvases.length - 1);
+    } else if (enemy.state === 'alert') {
+      frameIdx = 0;
     } else if (enemy.state === 'chase' || enemy.state === 'patrol') {
       frameIdx = enemy.animFrame % 2;
     }
@@ -1263,15 +1481,10 @@ export class RaycasterEngine {
       ctx.restore();
     }
 
-    // 4. Walk Animation & Step Bobbing:
-    // Add vertical sine-wave bounce (stepBob = abs(sin(walkTimer * 8)) * 0.05 * height) to enemy rendering during movement
-    // to simulate footstep momentum.
-    const isMoving = (enemy.state === 'chase' || enemy.state === 'patrol' || enemy.state === 'search') &&
-      (enemy.speed > 0 || (enemy.vx * enemy.vx + enemy.vy * enemy.vy) > 0.001);
-
-    const walkTimer = (this.curTime || 0) * (enemy.speed > 3 ? 1.25 : 1.0) + (enemy.id * 1.618);
-    const stepBob = isMoving ? Math.abs(Math.sin(walkTimer * 8)) * 0.05 * spriteHeight : 0;
-    const drawStartY = Math.floor(feetY - spriteHeight - stepBob);
+    // 4. Grounded Animation & Positioning:
+    // Keep sprite feet anchored directly at feetY so enemies walk realistically on the floor without floating in the air.
+    // Flying units (like lost_soul) handle their hover altitude naturally in their sprite generator and elevation.
+    const drawStartY = Math.floor(feetY - spriteHeight);
 
     // 3. Distance Lighting & Fog Integration:
     // Apply distance-fog brightness scaling to enemy sprites (ctx.filter = brightness(...)) matching the wall slice fog math
@@ -1443,19 +1656,50 @@ export class RaycasterEngine {
     }
 
     // Health bar for Baron / Boss / Elites if visible
-    if (visibleStripes > 3 && enemy.health > 0 && (enemy.type === 'baron' || enemy.type === 'boss' || enemy.isElite) && enemy.health < enemy.maxHealth) {
-      const barW = Math.max(30, spriteWidth * 0.8);
-      const barH = 5;
-      const barX = spriteScreenX - barW / 2;
-      const barY = drawStartY - (isGloryKillable ? 32 : (enemy.isElite ? 22 : 10));
-      const hpPct = Math.max(0, enemy.health / enemy.maxHealth);
+    if (visibleStripes > 3 && enemy.health > 0 && (enemy.type === 'baron' || enemy.type === 'boss' || enemy.isElite)) {
+      const isBoss = enemy.type === 'boss';
+      // Only skip if non-boss at full health
+      if (!isBoss && enemy.health >= enemy.maxHealth) {
+        // Skip full health non-boss
+      } else {
+        const barW = Math.max(isBoss ? 45 : 30, spriteWidth * (isBoss ? 0.95 : 0.8));
+        const barH = isBoss ? 7 : 5;
+        const barX = spriteScreenX - barW / 2;
+        const barY = drawStartY - (isGloryKillable ? 36 : (isBoss ? 28 : (enemy.isElite ? 22 : 10)));
+        const hpPct = Math.max(0, enemy.health / enemy.maxHealth);
 
-      ctx.save();
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(barX - 1, barY - 1, barW + 2, barH + 2);
-      ctx.fillStyle = enemy.isElite ? '#a855f7' : '#ef4444';
-      ctx.fillRect(barX, barY, barW * hpPct, barH);
-      ctx.restore();
+        ctx.save();
+        // If boss, draw glowing Boss Name and Subtitle banner above health bar
+        if (isBoss) {
+          const bossName = enemy.bossName || (enemy.isUltraBoss ? 'THE WARDEN' : 'SECTOR BOSS');
+          ctx.font = 'bold 11px monospace';
+          ctx.textAlign = 'center';
+          ctx.shadowColor = enemy.isUltraBoss ? '#a855f7' : '#ef4444';
+          ctx.shadowBlur = 8;
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(`☠ ${bossName} ☠`, spriteScreenX, barY - 5);
+        }
+
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(barX - 1, barY - 1, barW + 2, barH + 2);
+        
+        // Color-code health bar fill by boss type/elite
+        if (isBoss) {
+          if (enemy.stageBossId === 2) {
+            ctx.fillStyle = '#22c55e';
+          } else if (enemy.stageBossId === 3) {
+            ctx.fillStyle = '#f97316';
+          } else if (enemy.stageBossId === 4 || enemy.isUltraBoss) {
+            ctx.fillStyle = '#a855f7';
+          } else {
+            ctx.fillStyle = '#ef4444';
+          }
+        } else {
+          ctx.fillStyle = enemy.isElite ? '#a855f7' : '#ef4444';
+        }
+        ctx.fillRect(barX, barY, barW * hpPct, barH);
+        ctx.restore();
+      }
     }
 
     // Attack Telegraph Wind-Up Warning Indicator
@@ -1702,6 +1946,7 @@ export class RaycasterEngine {
 
     // 1. Soft additive glow halos behind high-tier pickups
     const haloConfig: Record<string, { inner: string; mid: string; mult: number }> = {
+      infinite_dash_relic: { inner: 'rgba(56, 189, 248, 0.88)', mid: 'rgba(234, 179, 8, 0.42)', mult: 1.65 },
       berserk_sphere: { inner: 'rgba(239, 68, 68, 0.80)', mid: 'rgba(168, 85, 247, 0.38)', mult: 1.55 },
       weapon_plasma: { inner: 'rgba(56, 189, 248, 0.85)', mid: 'rgba(14, 165, 233, 0.38)', mult: 1.45 },
       weapon_chaingun: { inner: 'rgba(245, 158, 11, 0.80)', mid: 'rgba(217, 119, 6, 0.32)', mult: 1.35 },
@@ -1953,11 +2198,12 @@ export class RaycasterEngine {
     _spriteWidth: number,
     spriteHeight: number,
     depth: number,
-    screenWidth: number
+    screenWidth: number,
+    isUnlocked = true
   ) {
     const stagePortals = this.textures.portalCanvases[this.curStageNumber] || this.textures.portalCanvases[1];
     const numFrames = stagePortals ? stagePortals.length : 1;
-    const frameIdx = Math.floor(this.curTime * 6) % Math.max(1, numFrames);
+    const frameIdx = isUnlocked ? (Math.floor(this.curTime * 6) % Math.max(1, numFrames)) : 0;
     const img = (stagePortals && stagePortals[frameIdx]) || this.textures.teleportCanvas;
     if (!img) return;
 
@@ -1986,13 +2232,15 @@ export class RaycasterEngine {
       4: { core: 'rgba(192, 132, 252, 0.80)', mid: 'rgba(107, 33, 168, 0.38)' }, // Void Violet
       5: { core: 'rgba(251, 191, 36, 0.85)', mid: 'rgba(217, 119, 6, 0.42)' },   // Chrono Solar Gold
     };
-    const halo = portalHalos[this.curStageNumber] || portalHalos[1];
+    const halo = isUnlocked
+      ? (portalHalos[this.curStageNumber] || portalHalos[1])
+      : { core: 'rgba(239, 68, 68, 0.45)', mid: 'rgba(153, 27, 27, 0.20)' };
 
     if (spriteScreenX >= 0 && spriteScreenX < screenWidth && depth < this.zBuffer[spriteScreenX] + 0.5) {
       const cx = spriteScreenX;
       const cy = drawStartY + sliceH * 0.45;
-      const pulse = 1.0 + Math.sin(this.curTime * 5.0) * 0.15;
-      const haloRadius = Math.max(20, (actualWidth * 0.85) * pulse);
+      const pulse = isUnlocked ? (1.0 + Math.sin(this.curTime * 5.0) * 0.15) : (0.85 + Math.sin(this.curTime * 2.5) * 0.08);
+      const haloRadius = Math.max(16, (actualWidth * (isUnlocked ? 0.85 : 0.55)) * pulse);
 
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
@@ -2007,8 +2255,8 @@ export class RaycasterEngine {
 
       // Dynamic floor contact shockwave ring at portal base
       const footY = drawEndY;
-      const ringRadiusX = Math.max(16, actualWidth * 0.65 * pulse);
-      const ringRadiusY = Math.max(5, ringRadiusX * 0.32);
+      const ringRadiusX = Math.max(14, actualWidth * (isUnlocked ? 0.65 : 0.45) * pulse);
+      const ringRadiusY = Math.max(4, ringRadiusX * 0.30);
       const floorGrad = ctx.createRadialGradient(cx, footY, 2, cx, footY, ringRadiusX);
       floorGrad.addColorStop(0, halo.core);
       floorGrad.addColorStop(0.6, halo.mid);
@@ -2040,6 +2288,96 @@ export class RaycasterEngine {
             sliceH
           );
         }
+      }
+    }
+
+    // 3. Dynamic Foreground Visuals (Active Vortex vs Locked Stasis Grid)
+    if (spriteScreenX >= 0 && spriteScreenX < screenWidth && depth < this.zBuffer[spriteScreenX] + 0.5) {
+      const cx = spriteScreenX;
+      const cy = drawStartY + sliceH * 0.48;
+      const t = this.curTime;
+
+      if (isUnlocked) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+
+        // Swirling orbital plasma rings
+        for (let i = 0; i < 3; i++) {
+          const angle = t * (2.2 + i * 0.8) + (i * Math.PI * 2) / 3;
+          const rx = (actualWidth * 0.42) * (0.85 + Math.sin(t * 3 + i) * 0.15);
+          const ry = rx * 0.38;
+          const px = cx + Math.cos(angle) * rx;
+          const py = cy + Math.sin(angle) * ry;
+
+          ctx.fillStyle = halo.core;
+          ctx.beginPath();
+          ctx.arc(px, py, Math.max(2, (actualWidth * 0.045)), 0, Math.PI * 2);
+          ctx.fill();
+
+          // Connected energy tracer trail
+          ctx.strokeStyle = halo.mid;
+          ctx.lineWidth = Math.max(1, actualWidth * 0.025);
+          ctx.beginPath();
+          ctx.ellipse(cx, cy, rx, ry, angle * 0.25, 0, Math.PI * 2);
+          ctx.stroke();
+        }
+
+        // Vertical ion beam shimmer down the portal center
+        const beamGrad = ctx.createLinearGradient(cx - 3, drawStartY, cx + 3, drawEndY);
+        beamGrad.addColorStop(0, 'rgba(255, 255, 255, 0)');
+        beamGrad.addColorStop(0.3, halo.core);
+        beamGrad.addColorStop(0.7, halo.core);
+        beamGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
+        ctx.fillStyle = beamGrad;
+        const beamW = Math.max(3, actualWidth * 0.12 * (1 + Math.sin(t * 8) * 0.25));
+        ctx.fillRect(cx - beamW / 2, drawStartY, beamW, sliceH);
+
+        ctx.restore();
+      } else {
+        // LOCKED STATE: Crimson Stasis Laser Grid & Warning Glyph
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+
+        // Dark dormant stasis field overlay over opening
+        const archW = actualWidth * 0.52;
+        const archH = sliceH * 0.65;
+        const archY = drawStartY + sliceH * 0.18;
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.75)';
+        ctx.fillRect(cx - archW / 2, archY, archW, archH);
+
+        // Horizontal red quarantine laser barrier lines
+        ctx.strokeStyle = 'rgba(239, 68, 68, 0.85)';
+        ctx.lineWidth = Math.max(1.5, actualWidth * 0.02);
+        const numBeams = 5;
+        for (let b = 1; b <= numBeams; b++) {
+          const by = archY + (archH * b) / (numBeams + 1);
+          const flicker = 0.6 + Math.sin(t * 12 + b) * 0.4;
+          ctx.globalAlpha = flicker;
+          ctx.beginPath();
+          ctx.moveTo(cx - archW / 2, by);
+          ctx.lineTo(cx + archW / 2, by);
+          ctx.stroke();
+        }
+        ctx.globalAlpha = 1.0;
+
+        // Central Stasis Lock Warning Glyph
+        const lockSize = Math.max(12, actualWidth * 0.22);
+        ctx.fillStyle = '#ef4444';
+        ctx.strokeStyle = '#f87171';
+        ctx.lineWidth = 1.5;
+
+        // Draw lock body
+        const lockX = cx - lockSize / 2;
+        const lockY = cy - lockSize * 0.2;
+        ctx.fillRect(lockX, lockY, lockSize, lockSize * 0.75);
+        ctx.strokeRect(lockX, lockY, lockSize, lockSize * 0.75);
+
+        // Lock shackle loop
+        ctx.beginPath();
+        ctx.arc(cx, lockY, lockSize * 0.32, Math.PI, 0);
+        ctx.stroke();
+
+        ctx.restore();
       }
     }
   }

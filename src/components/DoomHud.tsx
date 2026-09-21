@@ -2,19 +2,19 @@ import React from 'react';
 import { Player, KillCombo, BossState } from '../types';
 import { KillOMeterTachometer } from './KillOMeterTachometer';
 import { WeaponPixelIcon } from './WeaponPixelIcon';
-import { Shield, Skull, Heart, Lock, Flame, Radio, Target, Zap } from 'lucide-react';
+import { Shield, Skull, Heart, Lock, Flame, Radio, Target } from 'lucide-react';
 
 interface DoomHudProps {
   player: Player;
   combo: KillCombo;
   killOMeter: number;
   levelKills?: number;
+  requiredKills?: number;
   totalLevelEnemies?: number;
   isLockdown?: boolean;
   boss: BossState;
   bossHpPct: number;
   isTakingDamage?: boolean;
-  lookDirection?: 'left' | 'right' | 'straight';
   onSwitchWeapon: (slot: number) => void;
   stage?: number;
   totalStages?: number;
@@ -26,6 +26,7 @@ export const DoomHud: React.FC<DoomHudProps> = ({
   combo,
   killOMeter,
   levelKills = 0,
+  requiredKills,
   totalLevelEnemies = 10,
   isLockdown = false,
   boss,
@@ -99,27 +100,90 @@ export const DoomHud: React.FC<DoomHudProps> = ({
     <div id="doom-hud-root" className="w-full flex flex-col pointer-events-auto select-none font-mono-tech">
       {/* Top Boss Health Bar (during Lockdown) */}
       {boss.active && (
-        <div id="boss-health-bar" className="w-full max-w-xl mx-auto mb-1 px-3 py-1 bg-[#090a10]/95 border-2 border-red-600 rounded-md shadow-[0_0_25px_rgba(220,38,38,0.6)] backdrop-blur-md">
-          <div className="flex justify-between items-center mb-0.5 text-[10px] font-pixel text-red-400 tracking-wider">
-            <span className="flex items-center gap-1.5 font-bold">
-              <Skull className="w-3.5 h-3.5 text-red-500 animate-bounce" />
-              <span className="text-red-300">{boss.name}</span>
-            </span>
-            <span className="font-mono-tech text-red-300 font-bold bg-red-950/80 px-1.5 py-0.2 rounded border border-red-800">
-              {Math.max(0, Math.round(bossHpPct * 100))}%
-            </span>
+        <div
+          id="boss-health-bar"
+          className={`w-full max-w-2xl mx-auto mb-1 px-4 py-2 bg-black/95 rounded-md backdrop-blur-md transition-all duration-300 ${
+            bossHpPct <= 0.25
+              ? 'border-2 border-red-500 shadow-[0_0_30px_rgba(239,68,68,0.8)] animate-pulse'
+              : stage === 2
+              ? 'border-2 border-green-500 shadow-[0_0_25px_rgba(34,197,94,0.6)]'
+              : stage === 3
+              ? 'border-2 border-amber-500 shadow-[0_0_25px_rgba(245,158,11,0.6)]'
+              : stage === 4
+              ? 'border-2 border-purple-500 shadow-[0_0_28px_rgba(168,85,247,0.7)]'
+              : 'border-2 border-red-600 shadow-[0_0_25px_rgba(220,38,38,0.6)]'
+          }`}
+        >
+          {/* Top Label & Subtitle Row */}
+          <div className="flex justify-between items-center mb-1 text-[11px] font-pixel tracking-wider">
+            <div className="flex items-center gap-2">
+              <span className={`p-1 rounded ${
+                stage === 2 ? 'bg-green-950 text-green-400' :
+                stage === 3 ? 'bg-amber-950 text-amber-400' :
+                stage === 4 ? 'bg-purple-950 text-purple-300' : 'bg-red-950 text-red-400'
+              }`}>
+                <Skull className="w-4 h-4 animate-bounce" />
+              </span>
+              <div className="flex flex-col">
+                <span className="font-bold text-xs tracking-widest text-white drop-shadow-[0_0_8px_rgba(255,255,255,0.7)]">
+                  {boss.name}
+                </span>
+                {boss.subtitle && (
+                  <span className="text-[8px] font-mono-tech uppercase tracking-wider text-gray-400">
+                    {boss.subtitle}
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              {/* Boss Phase Badge */}
+              <span className={`px-2 py-0.5 rounded text-[8px] font-pixel font-bold tracking-widest border ${
+                boss.phase === 3
+                  ? 'bg-red-950 text-red-300 border-red-600 animate-pulse'
+                  : boss.phase === 2
+                  ? 'bg-amber-950 text-amber-300 border-amber-600'
+                  : 'bg-neutral-900 text-cyan-300 border-cyan-800'
+              }`}>
+                {boss.phase === 3 ? '⚡ PHASE III: ENRAGED' : boss.phase === 2 ? '⚡ PHASE II: OVERDRIVE' : 'PHASE I: SIEGE'}
+              </span>
+
+              {/* HP Percentage */}
+              <span className="font-mono-tech text-red-200 font-bold bg-neutral-950 px-2 py-0.5 rounded border border-neutral-700 text-xs shadow-inner">
+                {Math.max(0, Math.round(bossHpPct * 100))}%
+              </span>
+            </div>
           </div>
-          <div className="w-full h-2.5 bg-neutral-950 border border-red-900/80 rounded-xs overflow-hidden relative">
+
+          {/* Segmented Boss Health Bar with Shield FX */}
+          <div className="w-full h-3.5 bg-neutral-950 border border-neutral-800 rounded-sm overflow-hidden relative shadow-inner">
+            {/* Segmented tick markers (10 segments) */}
+            <div className="absolute inset-0 grid grid-cols-10 pointer-events-none z-20">
+              {Array.from({ length: 9 }).map((_, i) => (
+                <div key={i} className="border-r border-black/80 h-full" />
+              ))}
+            </div>
+
+            {/* Health Fill Bar */}
             <div
-              className={`h-full transition-all duration-150 ${
+              className={`h-full transition-all duration-150 relative ${
                 boss.shieldActive
-                  ? 'bg-cyan-400 shadow-[0_0_10px_#38bdf8]'
-                  : 'bg-gradient-to-r from-red-700 via-red-500 to-amber-500 shadow-[0_0_10px_#ef4444]'
+                  ? 'bg-cyan-400 shadow-[0_0_15px_#38bdf8]'
+                  : stage === 2
+                  ? 'bg-gradient-to-r from-green-700 via-emerald-500 to-lime-400 shadow-[0_0_12px_#22c55e]'
+                  : stage === 3
+                  ? 'bg-gradient-to-r from-red-800 via-orange-600 to-yellow-400 shadow-[0_0_12px_#f97316]'
+                  : stage === 4
+                  ? 'bg-gradient-to-r from-purple-900 via-violet-600 to-fuchsia-400 shadow-[0_0_15px_#a855f7]'
+                  : 'bg-gradient-to-r from-red-800 via-red-600 to-amber-500 shadow-[0_0_12px_#ef4444]'
               }`}
               style={{ width: `${Math.max(0, bossHpPct * 100)}%` }}
             />
+
+            {/* Shield Active Overlay */}
             {boss.shieldActive && (
-              <div className="absolute inset-0 flex items-center justify-center text-[7.5px] font-pixel text-cyan-200 font-bold tracking-widest bg-cyan-950/70 animate-pulse">
+              <div className="absolute inset-0 flex items-center justify-center text-[8px] font-pixel text-cyan-200 font-bold tracking-widest bg-cyan-950/80 animate-pulse z-30 border border-cyan-400/50">
+                <Shield className="w-3 h-3 mr-1 text-cyan-300" />
                 CYBER SHIELD ACTIVE
               </div>
             )}
@@ -387,6 +451,7 @@ export const DoomHud: React.FC<DoomHudProps> = ({
             <KillOMeterTachometer
               killOMeter={killOMeter}
               levelKills={levelKills}
+              requiredKills={requiredKills}
               totalLevelEnemies={totalLevelEnemies}
               isLockdown={isLockdown}
               isBerserk={player.berserkTimer > 0}

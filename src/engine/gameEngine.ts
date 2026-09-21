@@ -11,10 +11,14 @@ import {
   GameStats,
   FloatingText,
   Difficulty,
+  LevelTransition,
+  SecretArea,
+  GlorySplatterDrop,
 } from '../types';
 import { createStageMap, MapData } from './gameMap';
 import { ParticleSystem } from './particleSystem';
 import { soundSynth } from './soundSynth';
+import { gamepadManager } from './gamepadManager';
 
 export class GameEngine {
   public mapData: MapData;
@@ -22,6 +26,7 @@ export class GameEngine {
   public particles: ParticleSystem;
   public projectiles: Projectile[] = [];
   public floatingTexts: FloatingText[] = [];
+  public glorySplatters: GlorySplatterDrop[] = [];
   public combo: KillCombo;
   public boss: BossState;
   public stats: GameStats;
@@ -30,12 +35,19 @@ export class GameEngine {
   public currentStage = 1;
   public totalStages = 4;
   public inNeutralZone = true;
+  public airlockState: 'closed' | 'decompressing' | 'open' | 'sealing' | 'permanently_sealed' = 'closed';
+  public airlockTimer = 0;
+  public airlockAnimProgress = 0;
+  public airlockOpened = false;
+  public airlockSealed = false;
+  public safeZoneMedicUsed = false;
   public currentWave = 0;
   public waveBanner = '';
   public waveBannerTimer = 0;
 
   public levelKills = 0; // Number of enemies defeated on current stage
   public totalLevelEnemies = 0; // Total enemies placed on current stage
+  public requiredKills = 0; // Kills required to trigger boss lockdown on current stage
   public killOMeter = 0; // 0 to 100 Tachometer Kill-O'Meter progress toward Boss Lockdown
   public isLockdown = false;
   public isGameOver = false;
@@ -51,17 +63,19 @@ export class GameEngine {
   public exploredGrid: boolean[][] = [];
 
   // Stage warp / level transition state
-  public levelTransition = {
+  public levelTransition: LevelTransition = {
     active: false,
     timer: 0,
     maxTimer: 2.5,
     fromStage: 1,
     toStage: 2,
     stageName: '',
+    isDebriefWaiting: false,
   };
 
   private nextProjId = 1;
   private nextTextId = 1;
+  private nextSplatterId = 1;
   private spawnTimer = 4.0;
   private weaponFireTimer = 0;
   private lookSens = 0.0025;
@@ -69,6 +83,7 @@ export class GameEngine {
   public hitstopTimer = 0;
   private ambientDemonAudioTimer = 2.0;
   private lastChaingunShotTime = 0;
+  private lockedExitFeedbackTimer = 0;
 
   constructor(initialDifficulty: Difficulty = 'normal') {
     this.difficulty = initialDifficulty;
@@ -295,12 +310,66 @@ export class GameEngine {
       totalStages: 4,
     };
 
-    this.totalLevelEnemies = this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.totalLevelEnemies = this.mapData.totalEnemies || this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.requiredKills = this.mapData.requiredKills || Math.max(1, Math.ceil(this.totalLevelEnemies * 0.75));
     this.levelKills = 0;
     this.killOMeter = 0;
 
     this.sanitizeLoadedEnemies();
     this.initExploredGrid();
+  }
+
+  // Generates bounded room/sector patrol waypoints strictly within the enemy's assigned territory
+  public generatePatrolRoute(
+    target: Enemy | { x: number; y: number; radius?: number; homePost?: { x: number; y: number }; territoryRadius?: number; spawnOrigin?: { x: number; y: number } } | number,
+    optY?: number,
+    optRadius = 0.35
+  ): { x: number; y: number }[] {
+    let originX: number;
+    let originY: number;
+    let radius = optRadius;
+    let maxRadius = 3.5;
+
+    if (typeof target === 'number') {
+      originX = target;
+      originY = optY !== undefined ? optY : target;
+    } else {
+      const e = target;
+      const home = e.homePost || e.spawnOrigin || { x: e.x, y: e.y };
+      originX = home.x;
+      originY = home.y;
+      radius = e.radius || 0.35;
+      maxRadius = Math.max(2.0, (e.territoryRadius || 5.5) * 0.55);
+    }
+
+    const waypoints: { x: number; y: number }[] = [{ x: originX, y: originY }];
+    const angles = [0, Math.PI * 0.65, Math.PI * 1.35, Math.PI * 0.35, Math.PI * 1.7];
+
+    for (const ang of angles) {
+      if (waypoints.length >= 3) break;
+      const dist = 1.5 + Math.random() * (maxRadius - 1.5);
+      const tx = originX + Math.cos(ang) * dist;
+      const ty = originY + Math.sin(ang) * dist;
+      const gx = Math.floor(tx);
+      const gy = Math.floor(ty);
+      if (
+        gx >= 1 && gx < this.mapData.width - 1 &&
+        gy >= 1 && gy < this.mapData.height - 1 &&
+        this.mapData.grid[gy] && this.mapData.grid[gy][gx] === 0 &&
+        !this.checkWallCollision(tx, ty, radius + 0.12)
+      ) {
+        // Verify not inside player neutral start zone
+        const nz = this.mapData.neutralZone;
+        if (!nz || !(tx >= nz.minX - 0.5 && tx <= nz.maxX + 0.5 && ty >= nz.minY - 0.5 && ty <= nz.maxY + 0.5)) {
+          waypoints.push({ x: tx, y: ty });
+        }
+      }
+    }
+
+    if (waypoints.length === 1) {
+      waypoints.push({ x: originX, y: originY });
+    }
+    return waypoints;
   }
 
   // Ensures all pre-placed stage enemies are 100% free of wall penetrations and out-of-bound errors
@@ -310,6 +379,14 @@ export class GameEngine {
       e.x = safe.x;
       e.y = safe.y;
       e.spawnOrigin = { x: safe.x, y: safe.y };
+      if (!e.homePost) {
+        e.homePost = { x: safe.x, y: safe.y };
+      }
+      e.patrolWaypoints = this.generatePatrolRoute(e);
+      e.waypointIndex = 0;
+      e.state = Math.random() < 0.6 ? 'patrol' : 'idle';
+      e.stateTimer = 0.5 + Math.random() * 2.5;
+      e.patrolTimer = 4.0 + Math.random() * 3.0;
       e.stuckTimer = 0;
       e.painTimer = 0;
     }
@@ -353,7 +430,12 @@ export class GameEngine {
         this.exploredGrid[cy][cx] = true;
 
         // Stop ray at solid wall, revealing the wall surface boundary but keeping secret rooms behind it pitch dark
-        if (this.mapData.grid[cy][cx] > 0) {
+        const sec = this.mapData.secrets.find(s => s.doorX === cx && s.doorY === cy);
+        const airlock = this.mapData.airlockDoors?.find(a => a.x === cx && a.y === cy);
+        const isLowered = (sec && ((sec.animOffset || 0) >= 0.7 || (sec.revealed && !sec.animating))) ||
+                          (airlock && (airlock.animOffset || 0) >= 0.7);
+
+        if (this.mapData.grid[cy][cx] > 0 && !isLowered) {
           break;
         }
       }
@@ -362,6 +444,13 @@ export class GameEngine {
 
   public setDifficulty(diff: Difficulty) {
     this.difficulty = diff;
+    if (this.levelKills === 0 && !this.boss.active) {
+      // Re-apply difficulty balance to current stage if player is at start
+      this.mapData = createStageMap(this.currentStage, this.difficulty);
+      this.sanitizeLoadedEnemies();
+      this.totalLevelEnemies = this.mapData.totalEnemies || this.mapData.enemies.filter(e => e.type !== 'boss').length;
+      this.requiredKills = this.mapData.requiredKills || Math.max(1, Math.ceil(this.totalLevelEnemies * 0.75));
+    }
   }
 
   // --- RESTART GAME ---
@@ -373,11 +462,13 @@ export class GameEngine {
     this.totalStages = 4;
     this.mapData = createStageMap(1, this.difficulty);
     this.sanitizeLoadedEnemies();
-    this.totalLevelEnemies = this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.totalLevelEnemies = this.mapData.totalEnemies || this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.requiredKills = this.mapData.requiredKills || Math.max(1, Math.ceil(this.totalLevelEnemies * 0.75));
     this.levelKills = 0;
     this.particles.clear();
     this.projectiles = [];
     this.floatingTexts = [];
+    this.glorySplatters = [];
     this.killOMeter = 0;
     this.isLockdown = false;
     this.isGameOver = false;
@@ -390,6 +481,13 @@ export class GameEngine {
     this.gameTime = 0;
     this.weaponFireTimer = 0;
     this.inNeutralZone = true;
+    this.airlockState = 'closed';
+    this.airlockTimer = 0;
+    this.airlockAnimProgress = 0;
+    this.airlockOpened = false;
+    this.airlockSealed = false;
+    this.safeZoneMedicUsed = false;
+    soundSynth.setSafeZoneAudio(true);
     this.currentWave = 0;
     this.waveBanner = '';
     this.waveBannerTimer = 0;
@@ -474,20 +572,30 @@ export class GameEngine {
     this.stats.currentStage = this.currentStage;
     this.mapData = createStageMap(this.currentStage, this.difficulty);
     this.sanitizeLoadedEnemies();
-    this.totalLevelEnemies = this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.totalLevelEnemies = this.mapData.totalEnemies || this.mapData.enemies.filter(e => e.type !== 'boss').length;
+    this.requiredKills = this.mapData.requiredKills || Math.max(1, Math.ceil(this.totalLevelEnemies * 0.75));
     this.levelKills = 0;
     this.particles.clear();
     this.projectiles = [];
     this.floatingTexts = [];
+    this.glorySplatters = [];
     this.killOMeter = 0;
     this.isLockdown = false;
     this.inNeutralZone = true;
+    this.airlockState = 'closed';
+    this.airlockTimer = 0;
+    this.airlockAnimProgress = 0;
+    this.airlockOpened = false;
+    this.airlockSealed = false;
+    this.safeZoneMedicUsed = false;
+    soundSynth.setSafeZoneAudio(true);
     this.currentWave = 0;
     this.waveBanner = '';
     this.waveBannerTimer = 0;
     this.spawnTimer = 4.0;
 
     this.levelTransition.active = false;
+    this.levelTransition.isDebriefWaiting = false;
 
     // Reset player position to new stage entrance
     this.player.x = this.mapData.playerStart.x;
@@ -609,7 +717,8 @@ export class GameEngine {
 
   public triggerDash(moveX: number, moveY: number) {
     if (this.isGameOver || this.isVictory || this.isPaused) return;
-    if (this.player.dash.cooldown <= 0 && !this.player.dash.active) {
+    const hasInfiniteDash = (this.player.infiniteDashTimer || 0) > 0;
+    if ((this.player.dash.cooldown <= 0 || hasInfiniteDash) && !this.player.dash.active) {
       // Default to forward dash if stationary
       let effectiveX = moveX;
       let effectiveY = moveY;
@@ -620,7 +729,7 @@ export class GameEngine {
 
       this.player.dash.active = true;
       this.player.dash.duration = this.player.dash.maxDuration;
-      this.player.dash.cooldown = this.player.dash.maxCooldown;
+      this.player.dash.cooldown = hasInfiniteDash ? 0 : this.player.dash.maxCooldown;
 
       // Calculate world direction from movement vector
       const cos = Math.cos(this.player.angle);
@@ -630,6 +739,7 @@ export class GameEngine {
       this.player.invulnerableTimer = 0.25; // i-frames during dash!
 
       soundSynth.playDash();
+      gamepadManager.playDashRumble();
     }
   }
 
@@ -705,6 +815,7 @@ export class GameEngine {
       this.player.weaponAnim.recoilVel = 22;
       this.player.screenShake = 2.5;
       soundSynth.playFist();
+      gamepadManager.playWeaponRumble('fist');
 
       // Visceral close-range punch
       this.executeHitscan(this.player.angle, weapon.damage * damageMult, weapon.range, weapon.knockback);
@@ -775,23 +886,10 @@ export class GameEngine {
       this.particles.spawnShellCasing(this.player.x, this.player.y, this.player.angle, 'brass_bullet');
 
       soundSynth.playChaingun();
+      gamepadManager.playWeaponRumble('chaingun');
 
-      // Alert lurking enemies in the maze within acoustic radius (20 units)
-      for (const enemy of this.mapData.enemies) {
-        if (enemy.health > 0 && (enemy.state === 'idle' || enemy.state === 'patrol' || enemy.state === 'search')) {
-          const dist = Math.hypot(enemy.x - this.player.x, enemy.y - this.player.y);
-          if (dist < 20) {
-            enemy.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-            const hasLOS = this.checkLineOfSight(enemy.x, enemy.y, this.player.x, this.player.y);
-            if (hasLOS) {
-              enemy.state = 'chase';
-            } else {
-              enemy.state = 'search';
-              enemy.searchTimer = 4.5;
-            }
-          }
-        }
-      }
+      // Soundproofed gunfire: Alert nearby enemies in the sector outside the sealed safe room
+      this.alertNearbyEnemies(this.player.x, this.player.y, 14);
 
       const spreadAngle = (Math.random() - 0.5) * weapon.spread;
       const shootAngle = this.player.angle + spreadAngle;
@@ -843,6 +941,7 @@ export class GameEngine {
     this.player.screenShake = Math.max(this.player.screenShake, weapon.recoil * 0.4);
 
     // Audio
+    gamepadManager.playWeaponRumble(weapon.type);
     if (weapon.type === 'pistol') {
       soundSynth.playPistol();
       this.particles.spawnShellCasing(this.player.x, this.player.y, this.player.angle, 'brass_bullet');
@@ -855,22 +954,8 @@ export class GameEngine {
       soundSynth.playPlasmaRifle();
     }
 
-    // Alert lurking enemies in the maze within acoustic radius (20 units)
-    for (const enemy of this.mapData.enemies) {
-      if (enemy.health > 0 && (enemy.state === 'idle' || enemy.state === 'patrol' || enemy.state === 'search')) {
-        const dist = Math.hypot(enemy.x - this.player.x, enemy.y - this.player.y);
-        if (dist < 20) {
-          enemy.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-          const hasLOS = this.checkLineOfSight(enemy.x, enemy.y, this.player.x, this.player.y);
-          if (hasLOS) {
-            enemy.state = 'chase';
-          } else {
-            enemy.state = 'search';
-            enemy.searchTimer = 4.5;
-          }
-        }
-      }
-    }
+    // Soundproofed gunfire: Alert nearby enemies in the sector outside the sealed safe room
+    this.alertNearbyEnemies(this.player.x, this.player.y, 14);
 
     // Projectile vs Hitscan execution
     if (weapon.type === 'plasma') {
@@ -920,9 +1005,10 @@ export class GameEngine {
       const testX = this.player.x + dirX * currDist;
       const testY = this.player.y + dirY * currDist;
 
-      // 1. Check Enemies
+      // 1. Check Enemies (with fast AABB pre-rejection)
       for (const e of this.mapData.enemies) {
         if (e.health > 0) {
+          if (Math.abs(e.x - testX) > e.radius || Math.abs(e.y - testY) > e.radius) continue;
           const d = Math.hypot(e.x - testX, e.y - testY);
           if (d < e.radius) {
             hitEnemy = e;
@@ -932,10 +1018,11 @@ export class GameEngine {
       }
       if (hitEnemy) break;
 
-      // 2. Check Supply Chests (shoot to open)
+      // 2. Check Supply Chests (shoot to open with fast AABB pre-rejection)
       if (this.mapData.chests) {
         for (const c of this.mapData.chests) {
           if (!c.opened) {
+            if (Math.abs(c.x - testX) > 0.45 || Math.abs(c.y - testY) > 0.45) continue;
             if (Math.hypot(c.x - testX, c.y - testY) < 0.45) {
               hitChest = c;
               break;
@@ -972,18 +1059,31 @@ export class GameEngine {
       const mY = Math.floor(hitWallY);
       const offset = hitSide === 0 ? hitWallY - mY : hitWallX - mX;
       this.particles.addWallDecal(mX, mY, hitSide, offset, 0.5, 'bullet_hole');
+    }
+  }
 
-      // Check if shooting a secret wall reveals the hidden passage
-      for (const sec of this.mapData.secrets) {
-        if (!sec.revealed && ((sec.doorX === mX && sec.doorY === mY) || (sec.triggerX === mX && sec.triggerY === mY))) {
-          sec.revealed = true;
-          this.mapData.grid[sec.doorY][sec.doorX] = 0;
-          this.stats.secretsFound++;
-          soundSynth.playSecretDoorSlide();
-          soundSynth.playSecretDiscovery();
-          this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.5, '#facc15', 24);
-          this.spawnFloatingText(`⭐ SECRET REVEALED: ${sec.name}! (${this.stats.secretsFound}/${this.stats.totalSecrets})`, 0, 0, '#facc15', false, 20);
-          this.spawnFloatingText(`REWARD: ${sec.rewardDescription}`, 0, 0, '#38bdf8', false, 17);
+  // --- SOUNDPROOFED GUNFIRE ACOUSTIC SENSING ---
+  public alertNearbyEnemies(originX: number, originY: number, soundRadius = 7.0) {
+    // If player is inside the sealed safe staging zone or airlock is closed, gunshots are completely soundproofed
+    if (this.inNeutralZone || this.airlockState !== 'open') return;
+
+    // Localized gunfire acoustic propagation
+    const effectiveRadius = originY >= 20 ? 4.5 : soundRadius;
+
+    for (const enemy of this.mapData.enemies) {
+      if (enemy.health <= 0 || enemy.state === 'dead' || enemy.state === 'gibbed' || enemy.state === 'pain' || enemy.state === 'staggered') continue;
+      if (enemy.state === 'chase' || enemy.state === 'attack') continue;
+
+      if (Math.abs(enemy.x - originX) >= effectiveRadius || Math.abs(enemy.y - originY) >= effectiveRadius) continue;
+      const dist = Math.hypot(enemy.x - originX, enemy.y - originY);
+      if (dist < effectiveRadius) {
+        const hasAcousticLOS = this.checkLineOfSight(enemy.x, enemy.y, originX, originY);
+        // Alert enemies only if close or with direct line of sight in their sector
+        if (hasAcousticLOS || dist < 2.5) {
+          enemy.lastSeenPlayerPos = { x: originX, y: originY };
+          enemy.state = 'search';
+          enemy.searchTimer = 2.5 + Math.random() * 1.5;
+          enemy.angle = Math.atan2(originY - enemy.y, originX - enemy.x);
         }
       }
     }
@@ -1027,14 +1127,26 @@ export class GameEngine {
     // Cast blood splatters to adjacent walls
     this.castBloodSplattersToWalls(enemy.x, enemy.y, kx !== 0 || ky !== 0 ? Math.atan2(ky, kx) : Math.random() * Math.PI * 2, 2);
 
-    // Tactical Alert Propagation: Alert nearby allies within acoustic radius (12 units)
+    // Tactical Alert Propagation: Alert max 1 nearby ally in the local room (<= 4.5 units with direct LOS)
+    const isPlayerTargetable = !this.inNeutralZone && (this.mapData.neutralZone ? this.player.y <= this.mapData.neutralZone.minY : true);
+    let alertedAllies = 0;
     for (const ally of this.mapData.enemies) {
+      if (alertedAllies >= 1) break;
       if (ally.health > 0 && ally.id !== enemy.id && (ally.state === 'idle' || ally.state === 'patrol')) {
+        if (Math.abs(ally.x - enemy.x) >= 4.5 || Math.abs(ally.y - enemy.y) >= 4.5) continue;
         const allyDist = Math.hypot(ally.x - enemy.x, ally.y - enemy.y);
-        if (allyDist < 12.0) {
-          ally.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-          ally.state = this.checkLineOfSight(ally.x, ally.y, this.player.x, this.player.y) ? 'chase' : 'search';
-          ally.searchTimer = 4.5;
+        if (allyDist < 4.5) {
+          const hasLOS = this.checkLineOfSight(ally.x, ally.y, enemy.x, enemy.y);
+          if (hasLOS) {
+            alertedAllies++;
+            ally.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+            if (isPlayerTargetable && this.checkLineOfSight(ally.x, ally.y, this.player.x, this.player.y)) {
+              ally.state = 'chase';
+            } else {
+              ally.state = 'search';
+            }
+            ally.searchTimer = 3.0;
+          }
         }
       }
     }
@@ -1119,25 +1231,20 @@ export class GameEngine {
     if (enemy.type !== 'boss') {
       this.levelKills++;
       
-      // Count remaining living non-boss enemies on this stage
-      const remainingLiving = this.mapData.enemies.filter(
-        e => e.type !== 'boss' && e.id !== enemy.id && e.health > 0
-      ).length;
+      const reqKills = Math.max(1, this.requiredKills || Math.ceil(this.totalLevelEnemies * 0.75));
+      const pct = Math.min(100, Math.round((this.levelKills / reqKills) * 100));
+      this.killOMeter = pct;
 
-      if (remainingLiving === 0) {
-        // Meter fills to 100% full ONLY if ALL enemies are killed on the level!
+      if (this.levelKills >= reqKills || pct >= 100) {
         this.killOMeter = 100;
         soundSynth.playRedlineWarning();
-        this.spawnFloatingText('🚨 ALL LEVEL HOSTILES EXTERMINATED! 🚨', 0, 0, '#ef4444', false, 24);
+        this.spawnFloatingText(`🚨 REQUIRED KILLS REACHED (${this.levelKills}/${reqKills})! 🚨`, 0, 0, '#ef4444', false, 24);
         this.spawnFloatingText('⚡ MAX REDLINE: BOSS LOCKDOWN ENGAGED! ⚡', 0, 0, '#facc15', false, 22);
       } else {
-        const targetTotal = Math.max(this.totalLevelEnemies, this.levelKills + remainingLiving);
-        this.totalLevelEnemies = targetTotal;
-        this.killOMeter = Math.min(99, Math.round((this.levelKills / targetTotal) * 100));
         soundSynth.playTachometerRev();
       }
 
-      // Check Boss Lockdown Trigger (Engaged strictly when all level hostiles are eliminated)
+      // Check Boss Lockdown Trigger
       if (this.killOMeter >= 100 && !this.boss.active && !this.boss.spawned) {
         this.triggerBossLockdown();
       }
@@ -1156,6 +1263,12 @@ export class GameEngine {
       this.particles.spawnGibExplosion(enemy.x, enemy.y, enemy.type === 'baron' ? 12 : 8, true, enemy.type);
       this.particles.addFloorDecal(enemy.x, enemy.y, 0.75, enemy.type === 'vile_spitter' ? 'slime' : 'blood');
       this.castBloodSplattersToWalls(enemy.x, enemy.y, Math.random() * Math.PI * 2, 4);
+
+      // Close-range violent gib splatters screen visor
+      const distToPlayer = Math.hypot(enemy.x - this.player.x, enemy.y - this.player.y);
+      if (distToPlayer <= 2.2) {
+        this.triggerGloryKillScreenSplatter(enemy.type, true);
+      }
     } else {
       enemy.state = 'dead';
       enemy.corpseTimer = 0;
@@ -1252,8 +1365,13 @@ export class GameEngine {
         this.triggerWardenMutationSequence();
       } else {
         this.mapData.exitUnlocked = true;
+        // Manifest extraction portal right where the boss fell in the arena
+        this.mapData.exitPos = { x: enemy.x, y: enemy.y };
         soundSynth.playStageClear();
-        this.spawnFloatingText(`⚡ SECTOR ${this.currentStage} BOSS DEFEATED! ENTER THE RIFT! ⚡`, this.player.x, this.player.y, '#38bdf8', true, 24);
+        this.particles.spawnGibExplosion(enemy.x, enemy.y, 18, true, 'boss');
+        this.particles.spawnSparks(enemy.x, enemy.y, 0.6, '#38bdf8', 30);
+        this.particles.spawnSteam(enemy.x, enemy.y, 0.3, 5, 1.4);
+        this.spawnFloatingText(`⚡ SECTOR ${this.currentStage} BOSS DEFEATED! EXTRACTION PORTAL ONLINE! ⚡`, this.player.x, this.player.y, '#38bdf8', true, 26);
       }
     }
   }
@@ -1334,7 +1452,16 @@ export class GameEngine {
       'HELLFIRE ARCH-TITAN',
       'THE WARDEN'
     ];
+    const stageBossSubtitles = [
+      '',
+      'HEAVY HYDRAULIC COMMANDER // SECTOR 1 APEX',
+      'CORROSIVE BIO-MECHANICAL OVERLORD // SECTOR 2 APEX',
+      'VOLCANIC BRIMSTONE WARLORD // SECTOR 3 APEX',
+      'APEX ELDRITCH MUTAGENIC COLOSSUS // FINAL THREAT'
+    ];
     this.boss.name = stageBossNames[this.currentStage] || (isUltra ? 'THE WARDEN' : 'CYBER-TITAN GOLIATH');
+    this.boss.subtitle = stageBossSubtitles[this.currentStage] || 'APEX SECTOR COLOSSUS';
+    this.boss.phase = 1;
     this.isLockdown = true;
 
     // Siren sound & alarm
@@ -1358,6 +1485,10 @@ export class GameEngine {
     const diffMult = this.difficulty === 'easy' ? 0.75 : (this.difficulty === 'hard' ? 1.25 : (this.difficulty === 'nightmare' ? 1.5 : 1.0));
     const finalHp = Math.round(baseHp * diffMult);
 
+    // Speed and cooldown scaling by difficulty for fair 1-on-1 duel
+    const speedMult = this.difficulty === 'easy' ? 0.85 : (this.difficulty === 'hard' ? 1.15 : (this.difficulty === 'nightmare' ? 1.30 : 1.0));
+    const cdMult = this.difficulty === 'easy' ? 1.35 : (this.difficulty === 'hard' ? 0.85 : (this.difficulty === 'nightmare' ? 0.70 : 1.0));
+
     // Spawn the Boss in North Sanctum with safe clearance
     const bossRadius = isUltra ? 0.95 : 0.8;
     const safeBossPos = this.findSafeEnemySpawnPos(this.mapData.bossSpawnPos.x, this.mapData.bossSpawnPos.y, bossRadius);
@@ -1375,14 +1506,36 @@ export class GameEngine {
       state: 'chase',
       stateTimer: 0,
       animFrame: 0,
-      speed: isUltra ? 3.3 : (this.currentStage === 1 ? 2.3 : 2.7),
-      attackCooldown: isUltra ? 1.0 : (this.currentStage === 1 ? 1.7 : 1.4),
+      speed: +( (isUltra ? 3.3 : (this.currentStage === 1 ? 2.3 : 2.7)) * speedMult ).toFixed(2),
+      attackCooldown: +( (isUltra ? 1.0 : (this.currentStage === 1 ? 1.7 : 1.4)) * cdMult ).toFixed(2),
       isElite: true,
       isUltraBoss: isUltra,
+      stageBossId: this.currentStage,
+      bossName: this.boss.name,
+      bossSubtitle: this.boss.subtitle,
       radius: bossRadius,
       spawnOrigin: { x: safeBossPos.x, y: safeBossPos.y },
     };
-    this.mapData.enemies.push(bossEnemy);
+
+    // 1-ON-1 BOSS DUEL MECHANIC:
+    // When the kill-o-meter is filled and the boss spawns, all other enemies disappear
+    // so the player fights the boss strictly 1 on 1!
+    let banishedCount = 0;
+    for (const e of this.mapData.enemies) {
+      if (e.type !== 'boss' && e.health > 0) {
+        banishedCount++;
+        this.particles.spawnSparks(e.x, e.y, 0.6, '#ef4444', 12);
+        this.particles.spawnSparks(e.x, e.y, 0.6, '#ff0055', 8);
+        this.particles.spawnSparks(e.x, e.y, 0.5, '#facc15', 6);
+        this.particles.addFloorDecal(e.x, e.y, 0.65, 'scorch_blast');
+      }
+    }
+
+    // Replace the enemy array with ONLY the boss (pure 1v1 duel)
+    this.mapData.enemies = [bossEnemy];
+
+    // Clear any lingering minion projectiles so the player isn't hit unfairly as the duel begins
+    this.projectiles = this.projectiles.filter(p => p.fromPlayer);
 
     this.spawnFloatingText(
       isUltra ? '☠️ WARNING: APOCALYPSE ULTRA BOSS SPAWNED ☠️' : `⚠️ EMERGENCY: ${this.boss.name} DETECTED ⚠️`,
@@ -1391,6 +1544,14 @@ export class GameEngine {
       '#ef4444',
       false,
       24
+    );
+    this.spawnFloatingText(
+      `⚡ 1-ON-1 DUEL ENGAGED: ${banishedCount} MINIONS BANISHED! ⚡`,
+      0,
+      0,
+      '#38bdf8',
+      false,
+      20
     );
   }
 
@@ -1441,6 +1602,11 @@ export class GameEngine {
       this.player.health = Math.max(100, this.player.health);
       soundSynth.playBerserkRage();
       lootLabel = `🔥 BERSERK COMBAT OVERDRIVE 🔥`;
+    } else if (type === 'infinite_dash_relic') {
+      this.player.infiniteDashTimer = 15.0;
+      this.player.dash.cooldown = 0;
+      soundSynth.playRelicPickup();
+      lootLabel = `⚡ CHRONO-HASTE ZERO-COOLDOWN DASH ⚡`;
     }
 
     this.player.healFlash = 0.5;
@@ -1481,6 +1647,7 @@ export class GameEngine {
     this.stats.damageTaken += effectiveAmount;
     this.player.damageFlash = 0.8;
     this.player.screenShake = Math.max(this.player.screenShake, 14);
+    gamepadManager.playDamageRumble(effectiveAmount);
 
     if (fromX !== undefined && fromY !== undefined) {
       this.player.lastDamageAngle = Math.atan2(fromY - this.player.y, fromX - this.player.x);
@@ -1626,6 +1793,7 @@ export class GameEngine {
       soundSynth.playFist();
       soundSynth.playHeavyImpactCrunch();
       soundSynth.playGloryKillSiphon();
+      gamepadManager.playGloryKillRumble();
 
       this.hitstopTimer = 0.08;
       this.player.screenShake = 12;
@@ -1639,6 +1807,9 @@ export class GameEngine {
 
       // Visual punch particles & sparks
       this.particles.spawnSparks(bestFinisherTarget.x, bestFinisherTarget.y, 0.5, '#f59e0b', 24);
+
+      // Trigger intense visceral screen splatter on glory kill!
+      this.triggerGloryKillScreenSplatter(bestFinisherTarget.type, false);
 
       // Deal lethal finisher damage & force gib execution
       this.damageEnemy(bestFinisherTarget, executeDamage, Math.cos(this.player.angle) * 1.8, Math.sin(this.player.angle) * 1.8);
@@ -1667,41 +1838,169 @@ export class GameEngine {
       return false;
     }
 
-    // 4. Whiff punch - play fist swing sound, trigger punch animation, and check secret/chest interact
+    // 4. Whiff punch - play fist swing sound and trigger punch animation
     this.triggerMeleeAnimation(false);
     soundSynth.playFist();
-    this.interact();
     return false;
   }
 
-  // --- SECRET & CHEST INTERACTION ---
+  // --- GLORY KILL / MELEE SCREEN SPLATTER GENERATOR ---
+  public triggerGloryKillScreenSplatter(enemyType = 'grunt', isMinor = false) {
+    const count = isMinor ? (4 + Math.floor(Math.random() * 3)) : (9 + Math.floor(Math.random() * 5));
+
+    let primaryColor = '#991b1b'; // Arterial dark crimson
+    let highlightColor = '#fca5a5';
+    let baseDark = '#7f1d1d';
+
+    if (enemyType === 'vile_spitter') {
+      primaryColor = '#15803d'; // Toxic green
+      highlightColor = '#86efac';
+      baseDark = '#14532d';
+    } else if (enemyType === 'plasma_gunner') {
+      primaryColor = '#0284c7'; // Energized bio-plasma cyan
+      highlightColor = '#bae6fd';
+      baseDark = '#0369a1';
+    } else if (enemyType === 'baron') {
+      primaryColor = '#b91c1c'; // Hellfire crimson
+      highlightColor = '#fecaca';
+      baseDark = '#450a0a';
+    }
+
+    for (let i = 0; i < count; i++) {
+      const isCenterSplash = !isMinor && i < 4;
+      const x = isCenterSplash
+        ? 0.32 + Math.random() * 0.36
+        : 0.04 + Math.random() * 0.92;
+      const y = isCenterSplash
+        ? 0.20 + Math.random() * 0.40
+        : 0.06 + Math.random() * 0.76;
+
+      const size = isCenterSplash
+        ? 28 + Math.random() * 38
+        : (isMinor ? 12 + Math.random() * 18 : 16 + Math.random() * 26);
+
+      const length = isCenterSplash
+        ? 70 + Math.random() * 140
+        : (isMinor ? 30 + Math.random() * 60 : 45 + Math.random() * 95);
+
+      const satCount = 4 + Math.floor(Math.random() * 5);
+      const satellites = [];
+      for (let s = 0; s < satCount; s++) {
+        const ang = Math.random() * Math.PI * 2;
+        const dist = size * (0.9 + Math.random() * 1.6);
+        satellites.push({
+          dx: Math.cos(ang) * dist,
+          dy: Math.sin(ang) * dist,
+          r: Math.max(2, 2.5 + Math.random() * (size * 0.22)),
+        });
+      }
+
+      this.glorySplatters.push({
+        id: this.nextSplatterId++,
+        x,
+        y,
+        size,
+        length,
+        dripProgress: 0,
+        opacity: 0.96 + Math.random() * 0.04,
+        color: Math.random() > 0.35 ? primaryColor : baseDark,
+        highlightColor,
+        satellites,
+        dripSpeed: 0.35 + Math.random() * 0.55,
+        decaySpeed: isMinor ? (0.45 + Math.random() * 0.20) : (0.28 + Math.random() * 0.12),
+      });
+    }
+
+    // Limit maximum active screen splatters to maintain optimal FPS
+    if (this.glorySplatters.length > 32) {
+      this.glorySplatters = this.glorySplatters.slice(-32);
+    }
+  }
+
+  // --- REVEAL SECRET WITH RECEDING WALL ANIMATION & SOUND ---
+  public revealSecret(sec: SecretArea): boolean {
+    if (sec.revealed) return false;
+    sec.revealed = true;
+    sec.animating = true;
+    sec.animOffset = 0;
+    sec.animTimer = 0;
+    this.stats.secretsFound++;
+    soundSynth.playSecretDoorSlide();
+    soundSynth.playSecretDiscovery();
+    this.player.screenShake = 4.2; // Heavy mechanical unseating tremor
+    this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.6, '#facc15', 32);
+    this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.4, '#fbbf24', 20);
+    this.particles.spawnSteam(sec.doorX + 0.5, sec.doorY + 0.5, 0.25, 16, 1.1);
+    this.spawnFloatingText(`⭐ SECRET REVEALED: ${sec.name}! (${this.stats.secretsFound}/${this.stats.totalSecrets})`, 0, 0, '#facc15', false, 20);
+    this.spawnFloatingText(`REWARD: ${sec.rewardDescription}`, 0, 0, '#38bdf8', false, 17);
+    return true;
+  }
+
+  // --- SAFE ZONE AIRLOCK DECOMPRESSION & SEALING CONTROLLER ---
+  public triggerAirlockButton(): boolean {
+    if (this.airlockState !== 'closed') return false;
+    this.airlockState = 'decompressing';
+    this.airlockTimer = 1.8;
+    this.airlockAnimProgress = 0;
+
+    const doorX = this.mapData.airlockDoors && this.mapData.airlockDoors.length > 0 ? (this.mapData.airlockDoors[0].x + 0.5) : 15.5;
+    const doorY = this.mapData.airlockDoors && this.mapData.airlockDoors.length > 0 ? (this.mapData.airlockDoors[0].y + 0.2) : 26.2;
+
+    soundSynth.playAirlockButtonPress();
+    soundSynth.playAirlockCycle();
+    this.particles.spawnSteam(doorX, doorY, 0.4, 20, 1.2);
+    this.particles.spawnSparks(doorX, doorY, 0.5, '#38bdf8', 16);
+    this.spawnFloatingText('⚠️ AIRLOCK DECOMPRESSION PROTOCOL INITIATED... ⚠️', 0, 0, '#38bdf8', false, 20);
+    this.player.screenShake = 3.5;
+    return true;
+  }
+
+  public openAirlock() {
+    if (this.airlockState === 'closed') {
+      this.triggerAirlockButton();
+    }
+  }
+
+  // --- ADVANCE CONFIRMED AFTER SECTOR DEBRIEF ---
+  public confirmLevelTransition() {
+    if (!this.levelTransition.active || !this.levelTransition.isDebriefWaiting) return;
+    this.levelTransition.isDebriefWaiting = false;
+    soundSynth.playTeleport();
+    this.levelTransition.timer = 1.3;
+    this.levelTransition.maxTimer = 1.3;
+  }
+
+  // --- SECRET, AIRLOCK & CHEST INTERACTION ---
   public interact(): boolean {
     if (this.isGameOver || this.isVictory || this.isPaused) return false;
 
-    // 1. Check Secret Walls
+    // 1. Check Airlock Gate Switch in Safe Staging Zone (press [E] to start level)
+    if (this.airlockState === 'closed' && this.inNeutralZone) {
+      return this.triggerAirlockButton();
+    }
+
+    // 2. Check Secret Push Walls (requires player to be close and facing directly toward the hidden wall)
     for (const sec of this.mapData.secrets) {
       if (sec.revealed) continue;
-      const distTrigger = Math.hypot((sec.triggerX + 0.5) - this.player.x, (sec.triggerY + 0.5) - this.player.y);
-      const distDoor = Math.hypot((sec.doorX + 0.5) - this.player.x, (sec.doorY + 0.5) - this.player.y);
-      if (distTrigger < 2.0 || distDoor < 2.0) {
-        sec.revealed = true;
-        this.mapData.grid[sec.doorY][sec.doorX] = 0; // slide wall open
-        this.stats.secretsFound++;
-        soundSynth.playSecretDoorSlide();
-        soundSynth.playSecretDiscovery();
-        this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.5, '#facc15', 24);
-        this.spawnFloatingText(`⭐ SECRET REVEALED: ${sec.name}! (${this.stats.secretsFound}/${this.stats.totalSecrets})`, 0, 0, '#facc15', false, 20);
-        this.spawnFloatingText(`REWARD: ${sec.rewardDescription}`, 0, 0, '#38bdf8', false, 17);
-        return true;
+      const dx = (sec.doorX + 0.5) - this.player.x;
+      const dy = (sec.doorY + 0.5) - this.player.y;
+      const distDoor = Math.hypot(dx, dy);
+      if (distDoor < 1.85) {
+        const facingAngle = this.player.angle;
+        const toDoorAngle = Math.atan2(dy, dx);
+        const angleDiff = Math.abs(Math.atan2(Math.sin(toDoorAngle - facingAngle), Math.cos(toDoorAngle - facingAngle)));
+        if (angleDiff < 1.15) { // ~65 degree cone facing the wall
+          return this.revealSecret(sec);
+        }
       }
     }
 
-    // 2. Check Supply Chests
+    // 3. Check Supply Chests
     if (this.mapData.chests) {
       for (const c of this.mapData.chests) {
         if (!c.opened) {
           const dist = Math.hypot(c.x - this.player.x, c.y - this.player.y);
-          if (dist < 1.85) {
+          if (dist < 1.85 && this.checkLineOfSight(this.player.x, this.player.y, c.x, c.y)) {
             return this.openChest(c);
           }
         }
@@ -1759,23 +2058,30 @@ export class GameEngine {
       }
     }
 
-    // Collect all open safe tiles across the active sector
-    const openTiles: { x: number; y: number }[] = [];
+    // Collect all open safe tiles across the active sector, grouped into quadrants to distribute across rooms
+    const quadrants: { x: number; y: number }[][] = [[], [], [], []]; // NW, NE, SW, SE
+    const midX = this.mapData.width / 2;
+    const midY = this.mapData.height / 2;
+
     for (let y = 1; y < this.mapData.height - 1; y++) {
       for (let x = 1; x < this.mapData.width - 1; x++) {
         const cx = x + 0.5;
         const cy = y + 0.5;
         if (isSafe(cx, cy)) {
           const pDist = Math.hypot(cx - this.player.x, cy - this.player.y);
-          if (pDist > 4.5) {
-            openTiles.push({ x: cx, y: cy });
+          if (pDist > 8.0) {
+            const qIdx = (cx < midX ? 0 : 1) + (cy < midY ? 0 : 2);
+            quadrants[qIdx].push({ x: cx, y: cy });
           }
         }
       }
     }
 
-    if (openTiles.length > 0) {
-      return openTiles[Math.floor(Math.random() * openTiles.length)];
+    // Pick a non-empty quadrant at random to guarantee room distribution
+    const validQuads = quadrants.filter((q) => q.length > 0);
+    if (validQuads.length > 0) {
+      const chosenQuad = validQuads[Math.floor(Math.random() * validQuads.length)];
+      return chosenQuad[Math.floor(Math.random() * chosenQuad.length)];
     }
 
     // Fallback: any walkable cell with collision clearance
@@ -1792,7 +2098,7 @@ export class GameEngine {
     return { x: this.mapData.playerStart.x, y: this.mapData.playerStart.y };
   }
 
-  // --- WAVE ASSAULT SYSTEM ---
+  // --- WAVE TRACKER ---
   public startWave(waveNum: number) {
     this.currentWave = waveNum;
     this.stats.waveReached = Math.max(this.stats.waveReached, waveNum);
@@ -1800,149 +2106,6 @@ export class GameEngine {
     this.waveBannerTimer = 3.5;
     soundSynth.playWaveIncoming();
     this.spawnFloatingText(`⚠️ WAVE ${waveNum} INCOMING! ⚠️`, 0, 0, '#ef4444', false, 20);
-
-    if (this.currentStage === 1) {
-      // Stage 1: Strictly introductory Grunts, Imps, and Scuttlers
-      if (waveNum === 1) {
-        this.spawnEnemyAt(14.0, 22.0, 'grunt', false);
-        this.spawnEnemyAt(18.0, 22.0, 'grunt', false);
-        this.spawnEnemyAt(16.0, 18.0, 'scuttler', false);
-      } else if (waveNum === 2) {
-        this.spawnEnemyAt(12.0, 18.0, 'scuttler', false);
-        this.spawnEnemyAt(20.0, 18.0, 'scuttler', false);
-        this.spawnEnemyAt(16.0, 16.0, 'imp', false);
-        this.spawnEnemyAt(16.0, 22.0, 'grunt', false);
-      } else if (waveNum === 3) {
-        this.spawnEnemyAt(14.0, 16.0, 'imp', false);
-        this.spawnEnemyAt(18.0, 16.0, 'imp', false);
-        this.spawnEnemyAt(12.0, 20.0, 'scuttler', false);
-        this.spawnEnemyAt(20.0, 20.0, 'scuttler', false);
-        this.spawnEnemyAt(16.0, 24.0, 'grunt', true);
-      } else if (waveNum >= 4) {
-        if (!this.boss.active && !this.boss.spawned) {
-          this.triggerBossLockdown();
-        } else {
-          this.spawnRandomEnemyWave();
-        }
-      }
-    } else if (this.currentStage === 2) {
-      // Stage 2: Introduces Vile Spitters and Plasma Gunners
-      if (waveNum === 1) {
-        this.spawnEnemyAt(14.0, 22.0, 'grunt', false);
-        this.spawnEnemyAt(18.0, 22.0, 'imp', false);
-        this.spawnEnemyAt(16.0, 18.0, 'scuttler', false);
-      } else if (waveNum === 2) {
-        this.spawnEnemyAt(12.0, 18.0, 'plasma_gunner', false);
-        this.spawnEnemyAt(20.0, 18.0, 'scuttler', true);
-        this.spawnEnemyAt(16.0, 16.0, 'imp', true);
-      } else if (waveNum === 3) {
-        this.spawnEnemyAt(14.0, 16.0, 'vile_spitter', false);
-        this.spawnEnemyAt(18.0, 16.0, 'plasma_gunner', true);
-        this.spawnEnemyAt(16.0, 22.0, 'scuttler', true);
-      } else if (waveNum >= 4) {
-        if (!this.boss.active && !this.boss.spawned) {
-          this.triggerBossLockdown();
-        } else {
-          this.spawnRandomEnemyWave();
-        }
-      }
-    } else if (this.currentStage === 3) {
-      // Stage 3: Introduces Demonic Barons of Hell & Lost Souls
-      if (waveNum === 1) {
-        this.spawnEnemyAt(14.0, 22.0, 'imp', false);
-        this.spawnEnemyAt(18.0, 22.0, 'plasma_gunner', false);
-        this.spawnEnemyAt(16.0, 18.0, 'lost_soul', false);
-      } else if (waveNum === 2) {
-        this.spawnEnemyAt(12.0, 18.0, 'vile_spitter', true);
-        this.spawnEnemyAt(20.0, 18.0, 'plasma_gunner', true);
-        this.spawnEnemyAt(16.0, 16.0, 'lost_soul', false);
-      } else if (waveNum === 3) {
-        this.spawnEnemyAt(16.0, 14.0, 'baron', true);
-        this.spawnEnemyAt(12.0, 18.0, 'vile_spitter', true);
-        this.spawnEnemyAt(20.0, 18.0, 'plasma_gunner', true);
-      } else if (waveNum >= 4) {
-        if (!this.boss.active && !this.boss.spawned) {
-          this.triggerBossLockdown();
-        } else {
-          this.spawnRandomEnemyWave();
-        }
-      }
-    } else {
-      // Stage 4: Apocalypse Demonic Horde
-      if (waveNum === 1) {
-        this.spawnEnemyAt(14.0, 22.0, 'plasma_gunner', true);
-        this.spawnEnemyAt(18.0, 22.0, 'vile_spitter', true);
-        this.spawnEnemyAt(16.0, 18.0, 'lost_soul', false);
-      } else if (waveNum === 2) {
-        this.spawnEnemyAt(12.0, 18.0, 'baron', true);
-        this.spawnEnemyAt(20.0, 18.0, 'plasma_gunner', true);
-        this.spawnEnemyAt(16.0, 16.0, 'vile_spitter', true);
-      } else if (waveNum === 3) {
-        this.spawnEnemyAt(14.0, 14.0, 'baron', true);
-        this.spawnEnemyAt(18.0, 14.0, 'baron', true);
-        this.spawnEnemyAt(16.0, 20.0, 'plasma_gunner', true);
-      } else if (waveNum >= 4) {
-        if (!this.boss.active && !this.boss.spawned) {
-          this.triggerBossLockdown();
-        } else {
-          this.spawnRandomEnemyWave();
-          this.spawnRandomEnemyWave();
-        }
-      }
-    }
-  }
-
-  private spawnEnemyAt(x: number, y: number, type: Enemy['type'], isElite: boolean) {
-    let radius = 0.35;
-    if (type === 'baron') radius = 0.45;
-    else if (type === 'vile_spitter') radius = 0.44;
-    else if (type === 'plasma_gunner') radius = 0.38;
-    else if (type === 'scuttler' || type === 'lost_soul') radius = 0.32;
-
-    const safePos = this.findSafeEnemySpawnPos(x, y, radius);
-    let health = 40;
-    if (type === 'baron') health = 220;
-    else if (type === 'vile_spitter') health = 140;
-    else if (type === 'plasma_gunner') health = 90;
-    else if (type === 'imp') health = 70;
-    else if (type === 'scuttler') health = 55;
-    else if (type === 'lost_soul') health = 45;
-
-    const diffHpMult = this.difficulty === 'easy' ? 0.75 : (this.difficulty === 'hard' ? 1.25 : (this.difficulty === 'nightmare' ? 1.5 : 1.0));
-    const speedMult = this.difficulty === 'easy' ? 0.85 : (this.difficulty === 'hard' ? 1.18 : (this.difficulty === 'nightmare' ? 1.38 : 1.0));
-    const cdMult = this.difficulty === 'easy' ? 1.35 : (this.difficulty === 'hard' ? 0.82 : (this.difficulty === 'nightmare' ? 0.68 : 1.0));
-
-    let baseSpeed = 2.2 * speedMult;
-    if (type === 'scuttler') baseSpeed = 5.4 * speedMult;
-    else if (type === 'lost_soul') baseSpeed = 4.5 * speedMult;
-    else if (type === 'plasma_gunner') baseSpeed = 3.2 * speedMult;
-    else if (type === 'imp') baseSpeed = 2.6 * speedMult;
-    else if (type === 'baron') baseSpeed = 2.4 * speedMult;
-    else if (type === 'vile_spitter') baseSpeed = 2.1 * speedMult;
-
-    const finalHp = Math.round(health * diffHpMult * (isElite ? 1.5 : 1.0));
-
-    this.mapData.enemies.push({
-      id: Date.now() + Math.random(),
-      type,
-      x: safePos.x,
-      y: safePos.y,
-      z: 0,
-      vx: 0,
-      vy: 0,
-      angle: Math.random() * Math.PI * 2,
-      health: finalHp,
-      maxHealth: finalHp,
-      state: 'patrol',
-      stateTimer: 1.5 + Math.random() * 2.0,
-      patrolTimer: 3.0 + Math.random() * 3.0,
-      animFrame: 0,
-      speed: baseSpeed,
-      attackCooldown: +(1.4 * cdMult).toFixed(2),
-      isElite,
-      radius,
-      spawnOrigin: { x: safePos.x, y: safePos.y },
-    });
   }
 
   // --- FLOATING TEXT ---
@@ -2013,8 +2176,10 @@ export class GameEngine {
     this.gameTime += dt;
     this.stats.timeElapsed += dt;
 
-    // Check Exit Portal Proximity & Trigger Level Warp Transition
-    if (this.mapData.exitUnlocked && this.mapData.exitPos) {
+    // Check Exit Portal Proximity & Trigger Level Warp Transition (ONLY when unlocked after boss defeat)
+    if (this.mapData.exitPos && this.mapData.exitUnlocked) {
+      const distToExit = Math.hypot(this.player.x - this.mapData.exitPos.x, this.player.y - this.mapData.exitPos.y);
+
       // Atmospheric Exit Depressurization Steam & Particle Venting
       if (Math.random() < dt * 4.5) {
         this.particles.spawnSteam(
@@ -2026,7 +2191,6 @@ export class GameEngine {
         );
       }
 
-      const distToExit = Math.hypot(this.player.x - this.mapData.exitPos.x, this.player.y - this.mapData.exitPos.y);
       if (distToExit < 1.35 && !this.levelTransition.active) {
         if (this.currentStage >= this.totalStages) {
           this.isVictory = true;
@@ -2034,18 +2198,27 @@ export class GameEngine {
           return;
         }
         this.levelTransition.active = true;
-        this.levelTransition.timer = 2.4;
-        this.levelTransition.maxTimer = 2.4;
+        this.levelTransition.isDebriefWaiting = true;
+        this.levelTransition.timer = 1.4;
+        this.levelTransition.maxTimer = 1.4;
         this.levelTransition.fromStage = this.currentStage;
         this.levelTransition.toStage = this.currentStage + 1;
         this.levelTransition.stageName = `SECTOR ${this.currentStage + 1}`;
-        soundSynth.playTeleport();
+        this.levelTransition.stageCompleted = this.currentStage;
+        // Accurately record sector-specific stats for debrief card
+        this.levelTransition.kills = this.levelKills;
+        this.levelTransition.secretsFound = this.mapData.secrets.filter(s => s.revealed).length;
+        this.levelTransition.totalSecrets = this.mapData.secrets.length;
+        this.levelTransition.timeElapsed = this.stats.timeElapsed;
         soundSynth.playStageClear();
       }
     }
 
-    // Level Transition warp timer
+    // Level Transition warp timer (debounced while player reviews sector debrief)
     if (this.levelTransition.active) {
+      if (this.levelTransition.isDebriefWaiting) {
+        return; // Pause combat updates during sector debrief resting phase
+      }
       this.levelTransition.timer -= dt;
       if (this.levelTransition.timer <= 0) {
         this.levelTransition.active = false;
@@ -2054,16 +2227,242 @@ export class GameEngine {
       }
     }
 
-    // Check Neutral Zone Exit
-    if (this.inNeutralZone && this.player.y < this.mapData.neutralZone.minY) {
-      this.inNeutralZone = false;
-      this.startWave(1);
+    // Dynamic Safe Zone Check & Airlock Decompression / Lockdown Execution
+    const nz = this.mapData.neutralZone;
+    const isInsideSafeZone = Boolean(
+      nz &&
+      this.player.x >= nz.minX &&
+      this.player.x <= nz.maxX &&
+      this.player.y >= nz.minY &&
+      this.player.y <= nz.maxY
+    );
+
+    // 1. Handle Active Airlock Decompression Cycle (Hydraulic Opening Sequence)
+    if (this.airlockState === 'decompressing') {
+      this.airlockTimer -= dt;
+      const totalDuration = 2.0;
+      const rawProgress = Math.max(0, Math.min(1.0, 1.0 - this.airlockTimer / totalDuration));
+
+      // Multi-stage pneumatic & hydraulic easing curve:
+      // - Phase 1 (0.0 to 0.15): Mechanical unseating shudder with initial clamp release
+      // - Phase 2 (0.15 to 0.85): Smooth cubic ease-in-out pneumatic descent
+      // - Phase 3 (0.85 to 1.0): Soft hydraulic damper cushion into floor recess
+      let animOffset = 0;
+      if (rawProgress < 0.15) {
+        const t = rawProgress / 0.15;
+        animOffset = t * 0.05 + Math.sin(this.gameTime * 40) * 0.012;
+      } else if (rawProgress < 0.85) {
+        const t = (rawProgress - 0.15) / 0.70;
+        const eased = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        animOffset = 0.05 + eased * 0.87;
+      } else {
+        const t = (rawProgress - 0.85) / 0.15;
+        animOffset = 0.92 + (1 - Math.pow(1 - t, 2)) * 0.08;
+      }
+      this.airlockAnimProgress = Math.max(0, Math.min(1.0, animOffset));
+
+      if (this.mapData.airlockDoors) {
+        for (const d of this.mapData.airlockDoors) {
+          d.animOffset = this.airlockAnimProgress;
+        }
+      }
+
+      const door1 = this.mapData.airlockDoors?.[0];
+      const door2 = this.mapData.airlockDoors?.[1] || door1;
+      const doorX = door1 ? (door1.x + 0.5) : 15.5;
+      const doorY = door1 ? door1.y : 26;
+
+      // Continuous high-velocity lateral steam jets from door jambs and pneumatic clamp sparks
+      if (Math.random() < 0.65) {
+        this.particles.spawnSteam(door1 ? door1.x : 15, doorY + 0.2, 0.25, 3, 0.85);
+        this.particles.spawnSteam(door2 ? door2.x + 1 : 16.5, doorY + 0.2, 0.25, 3, 0.85);
+      }
+      if (Math.random() < 0.35) {
+        this.particles.spawnSparks(doorX + (Math.random() - 0.5) * 1.4, doorY + 0.2, 0.3, '#38bdf8', 4);
+      }
+
+      if (this.airlockTimer <= 0) {
+        this.airlockState = 'open';
+        this.airlockOpened = true;
+        this.airlockAnimProgress = 1.0;
+
+        // Clear solid door collision in grid
+        if (this.mapData.airlockDoors) {
+          for (const d of this.mapData.airlockDoors) {
+            if (this.mapData.grid[d.y]) {
+              this.mapData.grid[d.y][d.x] = 0;
+            }
+          }
+        }
+
+        soundSynth.playAirlockCycle();
+        soundSynth.setSafeZoneAudio(false);
+        this.particles.spawnSteam(doorX, doorY + 0.2, 0.5, 35, 1.6);
+        this.particles.spawnSparks(doorX, doorY + 0.2, 0.6, '#38bdf8', 28);
+        this.spawnFloatingText('🚪 BLAST DOORS OPEN // PROCEED INTO SECTOR', 0, 0, '#38bdf8', false, 22);
+        this.player.screenShake = 4.5;
+      }
     }
 
-    // Auto-check secrets proximity as walk-up discovery
+    const firstDoorY = this.mapData.airlockDoors?.[0]?.y ?? 26;
+    const combatThresholdY = firstDoorY - 0.6;
+
+    // 2. Handle Permanent Lockdown Transition (Closing Slam when Player leaves Safe Zone into Sector)
+    if (this.airlockState === 'open' && !this.airlockSealed && this.player.y <= combatThresholdY) {
+      this.airlockState = 'sealing';
+      this.airlockTimer = 0.90; // 0.90s fast heavy pneumatic slam
+      this.inNeutralZone = false;
+      soundSynth.setSafeZoneAudio(false);
+      this.spawnFloatingText('🛑 QUARANTINE BREACH: AIRLOCK SEALING...', 0, 0, '#ef4444', false, 20);
+      this.player.screenShake = 4.0;
+    }
+
+    if (this.airlockState === 'sealing') {
+      this.airlockTimer -= dt;
+      const totalDuration = 0.90;
+      const rawProgress = Math.max(0, Math.min(1.0, 1.0 - this.airlockTimer / totalDuration));
+
+      // Softlock prevention: Push player into combat sector if attempting to step back into sealing threshold
+      if (this.player.y > combatThresholdY) {
+        this.player.y = combatThresholdY - 0.1;
+        if (this.player.vy > 0) this.player.vy = 0;
+      }
+
+      // Accelerated heavy slam curve (easeInQuad)
+      const slamT = rawProgress * rawProgress;
+      this.airlockAnimProgress = Math.max(0, 1.0 - slamT);
+
+      if (this.mapData.airlockDoors) {
+        for (const d of this.mapData.airlockDoors) {
+          d.animOffset = this.airlockAnimProgress;
+        }
+      }
+
+      const door1 = this.mapData.airlockDoors?.[0];
+      const doorX = door1 ? (door1.x + 0.5) : 15.5;
+      const doorY = door1 ? door1.y : 26;
+
+      // Warning sparks & emergency steam along seams during rapid rise
+      if (Math.random() < 0.6) {
+        this.particles.spawnSparks(doorX + (Math.random() - 0.5) * 1.4, doorY + 0.2, 0.4, '#f59e0b', 5);
+        this.particles.spawnSteam(doorX, doorY + 0.2, 0.3, 4, 0.6);
+      }
+
+      // Re-enable solid collision at 50% closure
+      if (this.airlockAnimProgress <= 0.5 && this.mapData.airlockDoors) {
+        for (const d of this.mapData.airlockDoors) {
+          if (this.mapData.grid[d.y] && this.mapData.grid[d.y][d.x] === 0) {
+            this.mapData.grid[d.y][d.x] = 7;
+          }
+        }
+      }
+
+      if (this.airlockTimer <= 0) {
+        this.airlockState = 'permanently_sealed';
+        this.airlockSealed = true;
+        this.airlockAnimProgress = 0.0;
+
+        // Close blast doors permanently in grid
+        if (this.mapData.airlockDoors) {
+          for (const d of this.mapData.airlockDoors) {
+            if (this.mapData.grid[d.y]) {
+              this.mapData.grid[d.y][d.x] = 7;
+            }
+            d.animOffset = 0;
+            d.sealed = true;
+          }
+        }
+
+        soundSynth.playAirlockPermanentLockdown();
+        this.particles.spawnSparks(doorX, doorY, 0.7, '#ef4444', 45);
+        this.particles.spawnSteam(doorX, doorY, 0.45, 35, 1.2);
+        this.player.screenShake = 9;
+        this.spawnFloatingText('🛑 AIRLOCK SEALED — QUARANTINE PROTOCOL ENGAGED', 0, 0, '#ef4444', false, 24);
+        this.spawnFloatingText('⚠️ SAFE ZONE LOCKED: NO RETREAT PERMITTED ⚠️', 0, 0, '#f97316', false, 18);
+      }
+    }
+
+    // Dynamic safe zone state: Once permanently sealed, safe zone is strictly inaccessible
+    this.inNeutralZone = !this.airlockSealed && (this.airlockState === 'closed' || this.airlockState === 'decompressing' || isInsideSafeZone);
+
+    // Safe Zone Audio Muffling (Low-pass filter for calm sanctuary atmosphere inside bunker)
+    soundSynth.setSafeZoneAudio(this.inNeutralZone);
+
+    // Emergency Field Medic Restock Station inside Safe Staging Zone
+    if (this.inNeutralZone && !this.safeZoneMedicUsed) {
+      let restocked = false;
+      if (this.player.health < 50) {
+        this.player.health = 50;
+        this.player.healFlash = 0.5;
+        soundSynth.playPickup('medkit_large');
+        this.spawnFloatingText('💉 FIELD MEDIC: VITALS RESTORED TO 50 HP', this.player.x, this.player.y, '#4ade80', false, 18);
+        restocked = true;
+      }
+      if (this.player.ammo.bullets < 40) {
+        this.player.ammo.bullets = 40;
+        restocked = true;
+      }
+      if (this.player.weapons.shotgun.unlocked && this.player.ammo.shells < 12) {
+        this.player.ammo.shells = 12;
+        restocked = true;
+      }
+      if (restocked) {
+        this.safeZoneMedicUsed = true;
+      }
+    }
+
+    // Proximity Audio Feedback: Ultra-faint, subtle low-frequency mechanical hum only when directly adjacent to hidden seam
+    let minSecretDist = 999;
     for (const sec of this.mapData.secrets) {
-      if (!sec.revealed && Math.hypot((sec.triggerX + 0.5) - this.player.x, (sec.triggerY + 0.5) - this.player.y) < 0.85) {
-        this.interact();
+      if (!sec.revealed) {
+        const d = Math.hypot((sec.doorX + 0.5) - this.player.x, (sec.doorY + 0.5) - this.player.y);
+        if (d < minSecretDist) minSecretDist = d;
+      }
+    }
+    if (minSecretDist < 1.4) {
+      const proximity = Math.max(0, (1.0 - (minSecretDist / 1.4)) * 0.35);
+      soundSynth.updateSecretHum(proximity);
+    } else {
+      soundSynth.updateSecretHum(0);
+    }
+
+    // Update Receding Secret Wall Animations (Multi-stage hydraulic & stone descent sequence)
+    for (const sec of this.mapData.secrets) {
+      if (sec.animating) {
+        sec.animTimer = (sec.animTimer || 0) + dt;
+        const totalDuration = 1.25;
+        const rawProgress = Math.max(0, Math.min(1.0, sec.animTimer / totalDuration));
+
+        // Ultra-fluid multi-stage mechanical easing:
+        // - Phase 1 (0.0 to 0.15): Unseating shudder + initial latch release
+        // - Phase 2 (0.15 to 0.85): Smooth quintic ease-in-out descent of heavy slab
+        // - Phase 3 (0.85 to 1.0): Hydraulic damper cushion into floor recess
+        let animOffset = 0;
+        if (rawProgress < 0.15) {
+          const t = rawProgress / 0.15;
+          animOffset = t * 0.05 + Math.sin(this.gameTime * 45) * 0.014;
+        } else if (rawProgress < 0.85) {
+          const t = (rawProgress - 0.15) / 0.70;
+          const eased = t < 0.5 ? 16 * t * t * t * t * t : 1 - Math.pow(-2 * t + 2, 5) / 2;
+          animOffset = 0.05 + eased * 0.87;
+        } else {
+          const t = (rawProgress - 0.85) / 0.15;
+          animOffset = 0.92 + (1 - Math.pow(1 - t, 2)) * 0.08;
+        }
+        sec.animOffset = Math.max(0, Math.min(1.0, animOffset));
+
+        // Continuous sparks and steam along threshold seams during descent
+        if (Math.random() < 0.65) {
+          this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.3, '#facc15', 4);
+          this.particles.spawnSteam(sec.doorX + 0.5, sec.doorY + 0.5, 0.15, 3, 0.75);
+        }
+
+        // Keep rendering the lowering wall slab through the entire descent; passability is handled via checkWallCollision once animOffset >= 0.7
+        if (sec.animTimer >= totalDuration) {
+          sec.animating = false;
+          sec.animOffset = 1.0;
+          this.mapData.grid[sec.doorY][sec.doorX] = 0;
+        }
       }
     }
 
@@ -2114,6 +2513,18 @@ export class GameEngine {
     if (this.player.damageFlash > 0) this.player.damageFlash = Math.max(0, this.player.damageFlash - dt * 2.5);
     if (this.player.healFlash > 0) this.player.healFlash = Math.max(0, this.player.healFlash - dt * 2.5);
     if ((this.player.armorFlash || 0) > 0) this.player.armorFlash = Math.max(0, (this.player.armorFlash || 0) - dt * 2.5);
+
+    // Update Glory Kill Screen-Splatter Drops & Visceral Drips
+    if (this.glorySplatters.length > 0) {
+      for (let i = this.glorySplatters.length - 1; i >= 0; i--) {
+        const drop = this.glorySplatters[i];
+        drop.dripProgress = Math.min(1.0, drop.dripProgress + dt * drop.dripSpeed);
+        drop.opacity -= dt * drop.decaySpeed;
+        if (drop.opacity <= 0) {
+          this.glorySplatters.splice(i, 1);
+        }
+      }
+    }
 
     // Dynamic Chaingun Overheat & Heat Dissipation Loop
     if (this.player.chaingunOverheat) {
@@ -2176,6 +2587,19 @@ export class GameEngine {
     if (this.ambientDemonAudioTimer <= 0) {
       this.ambientDemonAudioTimer = 2.4 + Math.random() * 2.2;
       this.triggerSpatialDemonAudio();
+    }
+
+    // Infinite Dash Overdrive Timer
+    if (this.player.infiniteDashTimer && this.player.infiniteDashTimer > 0) {
+      this.player.infiniteDashTimer -= dt;
+      this.player.dash.cooldown = 0;
+      if (Math.random() < 0.25) {
+        this.particles.spawnSparks(this.player.x, this.player.y, 0.2, '#38bdf8', 2);
+      }
+      if (this.player.infiniteDashTimer <= 0) {
+        this.player.infiniteDashTimer = 0;
+        this.spawnFloatingText('CHRONO-HASTE EXPIRED', this.player.x, this.player.y, '#94a3b8', false, 16);
+      }
     }
 
     // Dash Cooldown & Active
@@ -2292,6 +2716,16 @@ export class GameEngine {
           return true;
         }
         if (this.mapData.grid[my] && this.mapData.grid[my][mx] > 0) {
+          // If secret door is sinking or revealed, it is passable once >= 70% lowered
+          const sec = this.mapData.secrets.find(s => s.doorX === mx && s.doorY === my);
+          if (sec && ((sec.animOffset || 0) >= 0.7 || (sec.revealed && !sec.animating))) {
+            continue;
+          }
+          // If airlock door is lowering, passable once >= 70% lowered
+          const airlock = this.mapData.airlockDoors?.find(a => a.x === mx && a.y === my);
+          if (airlock && (airlock.animOffset || 0) >= 0.7) {
+            continue;
+          }
           return true;
         }
       }
@@ -2300,6 +2734,22 @@ export class GameEngine {
   }
 
   // Depenetration Solver: Guarantees entity is never trapped inside wall geometry
+  public normalizeAngle(angle: number): number {
+    let a = angle;
+    while (a <= -Math.PI) a += Math.PI * 2;
+    while (a > Math.PI) a -= Math.PI * 2;
+    return a;
+  }
+
+  public smoothTurnAngle(current: number, target: number, maxRate: number, dt: number): number {
+    const diff = Math.atan2(Math.sin(target - current), Math.cos(target - current));
+    const maxStep = maxRate * dt;
+    if (Math.abs(diff) <= maxStep) {
+      return this.normalizeAngle(target);
+    }
+    return this.normalizeAngle(current + Math.sign(diff) * maxStep);
+  }
+
   private resolveWallDepenetration(x: number, y: number, r: number): { x: number; y: number } {
     let curX = x;
     let curY = y;
@@ -2310,7 +2760,19 @@ export class GameEngine {
 
     for (let my = minY; my <= maxY; my++) {
       for (let mx = minX; mx <= maxX; mx++) {
-        if (my < 0 || my >= this.mapData.height || mx < 0 || mx >= this.mapData.width || (this.mapData.grid[my] && this.mapData.grid[my][mx] > 0)) {
+        const isOutOfBounds = my < 0 || my >= this.mapData.height || mx < 0 || mx >= this.mapData.width;
+        let isSolidWall = isOutOfBounds;
+        if (!isOutOfBounds && this.mapData.grid[my] && this.mapData.grid[my][mx] > 0) {
+          const sec = this.mapData.secrets.find(s => s.doorX === mx && s.doorY === my);
+          const isPassableSecret = sec && ((sec.animOffset || 0) >= 0.7 || (sec.revealed && !sec.animating));
+          const airlock = this.mapData.airlockDoors?.find(a => a.x === mx && a.y === my);
+          const isPassableAirlock = airlock && (airlock.animOffset || 0) >= 0.7;
+          if (!isPassableSecret && !isPassableAirlock) {
+            isSolidWall = true;
+          }
+        }
+
+        if (isSolidWall) {
           const nearestX = Math.max(mx, Math.min(mx + 1, curX));
           const nearestY = Math.max(my, Math.min(my + 1, curY));
           const dx = curX - nearestX;
@@ -2418,48 +2880,53 @@ export class GameEngine {
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const p = this.projectiles[i];
       p.life += dt;
-      p.x += p.vx * dt;
-      p.y += p.vy * dt;
 
-      // Wall hit check
-      const mapX = Math.floor(p.x);
-      const mapY = Math.floor(p.y);
+      // Sub-stepping to prevent high-speed tunneling through thin walls or enemies
+      const moveDist = Math.hypot(p.vx * dt, p.vy * dt);
+      const subSteps = Math.max(1, Math.ceil(moveDist / 0.32));
+      const subDt = dt / subSteps;
       let hit = false;
 
-      if (mapY < 0 || mapY >= this.mapData.height || mapX < 0 || mapX >= this.mapData.width || (this.mapData.grid[mapY] && this.mapData.grid[mapY][mapX] > 0)) {
-        hit = true;
+      for (let step = 0; step < subSteps; step++) {
+        p.x += p.vx * subDt;
+        p.y += p.vy * subDt;
+
+        // Wall hit check
+        const mapX = Math.floor(p.x);
+        const mapY = Math.floor(p.y);
+
+        if (mapY < 0 || mapY >= this.mapData.height || mapX < 0 || mapX >= this.mapData.width || (this.mapData.grid[mapY] && this.mapData.grid[mapY][mapX] > 0)) {
+          hit = true;
+          // Projectile impact on wall geometry
+          break;
+        }
+
+        // Enemy hit check (with fast AABB pre-rejection)
         if (p.fromPlayer) {
-          for (const sec of this.mapData.secrets) {
-            if (!sec.revealed && ((sec.doorX === mapX && sec.doorY === mapY) || (sec.triggerX === mapX && sec.triggerY === mapY))) {
-              sec.revealed = true;
-              this.mapData.grid[sec.doorY][sec.doorX] = 0;
-              this.stats.secretsFound++;
-              soundSynth.playSecretDoorSlide();
-              soundSynth.playSecretDiscovery();
-              this.particles.spawnSparks(sec.doorX + 0.5, sec.doorY + 0.5, 0.5, '#facc15', 24);
-              this.spawnFloatingText(`⭐ SECRET REVEALED: ${sec.name}! (${this.stats.secretsFound}/${this.stats.totalSecrets})`, 0, 0, '#facc15', false, 20);
-              this.spawnFloatingText(`REWARD: ${sec.rewardDescription}`, 0, 0, '#38bdf8', false, 17);
+          for (const e of this.mapData.enemies) {
+            if (e.health > 0) {
+              const hitDist = e.radius + p.radius;
+              if (Math.abs(e.x - p.x) > hitDist || Math.abs(e.y - p.y) > hitDist) continue;
+              if (Math.hypot(e.x - p.x, e.y - p.y) < hitDist) {
+                this.damageEnemy(e, p.damage);
+                hit = true;
+                break;
+              }
             }
           }
+          if (hit) break;
         }
-      }
 
-      // Enemy hit check
-      if (!hit && p.fromPlayer) {
-        for (const e of this.mapData.enemies) {
-          if (e.health > 0 && Math.hypot(e.x - p.x, e.y - p.y) < e.radius + p.radius) {
-            this.damageEnemy(e, p.damage);
-            hit = true;
-            break;
+        // Player hit check
+        if (!p.fromPlayer) {
+          const playerHitDist = 0.35 + p.radius;
+          if (Math.abs(this.player.x - p.x) <= playerHitDist && Math.abs(this.player.y - p.y) <= playerHitDist) {
+            if (Math.hypot(this.player.x - p.x, this.player.y - p.y) < playerHitDist) {
+              this.damagePlayer(p.damage, p.x, p.y);
+              hit = true;
+              break;
+            }
           }
-        }
-      }
-
-      // Player hit check
-      if (!hit && !p.fromPlayer) {
-        if (Math.hypot(this.player.x - p.x, this.player.y - p.y) < 0.35 + p.radius) {
-          this.damagePlayer(p.damage, p.x, p.y);
-          hit = true;
         }
       }
 
@@ -2482,10 +2949,11 @@ export class GameEngine {
           soundSynth.playPlasmaRifle();
           this.particles.spawnSparks(p.x, p.y, p.z, p.type === 'plasma_blue' ? '#38bdf8' : '#22c55e', 14);
           this.particles.addFloorDecal(p.x, p.y, 0.4, p.type === 'plasma_blue' ? 'plasma_burn' : 'scorch');
-          // Splash damage for player plasma projectiles
+          // Splash damage for player plasma projectiles (with fast AABB pre-rejection)
           if (p.fromPlayer && p.splashRadius && p.splashRadius > 0) {
             for (const other of this.mapData.enemies) {
               if (other.health > 0) {
+                if (Math.abs(other.x - p.x) > p.splashRadius || Math.abs(other.y - p.y) > p.splashRadius) continue;
                 const sDist = Math.hypot(other.x - p.x, other.y - p.y);
                 if (sDist < p.splashRadius) {
                   const falloff = 1.0 - sDist / p.splashRadius;
@@ -2509,7 +2977,7 @@ export class GameEngine {
     const center = origin || { x: fromX, y: fromY };
     for (let attempts = 0; attempts < 12; attempts++) {
       const angle = Math.random() * Math.PI * 2;
-      const dist = 2.5 + Math.random() * 4.0;
+      const dist = 1.5 + Math.random() * 3.0;
       const tx = center.x + Math.cos(angle) * dist;
       const ty = center.y + Math.sin(angle) * dist;
       const gx = Math.floor(tx);
@@ -2564,17 +3032,19 @@ export class GameEngine {
       desiredAngle = e.unstuckNudgeAngle;
     }
 
-    // Whisker probes: direct angle first, then alternating angled probes to discover open pathways around corners
+    // Dynamic 11-whisker probe array: direct angle first, then alternating wide fan probes to navigate around pillars & doorway jams
     const testAngles = [
       desiredAngle,
-      desiredAngle + Math.PI / 6,       // +30 deg
-      desiredAngle - Math.PI / 6,       // -30 deg
-      desiredAngle + Math.PI / 3,       // +60 deg
-      desiredAngle - Math.PI / 3,       // -60 deg
-      desiredAngle + Math.PI / 2,       // +90 deg
-      desiredAngle - Math.PI / 2,       // -90 deg
-      desiredAngle + (2 * Math.PI) / 3, // +120 deg
-      desiredAngle - (2 * Math.PI) / 3, // -120 deg
+      desiredAngle + Math.PI / 8,         // +22.5 deg
+      desiredAngle - Math.PI / 8,         // -22.5 deg
+      desiredAngle + Math.PI / 4,         // +45 deg
+      desiredAngle - Math.PI / 4,         // -45 deg
+      desiredAngle + (3 * Math.PI) / 8,   // +67.5 deg
+      desiredAngle - (3 * Math.PI) / 8,   // -67.5 deg
+      desiredAngle + Math.PI / 2,         // +90 deg
+      desiredAngle - Math.PI / 2,         // -90 deg
+      desiredAngle + (3 * Math.PI) / 4,   // +135 deg
+      desiredAngle - (3 * Math.PI) / 4,   // -135 deg
     ];
 
     let chosenVx = 0;
@@ -2582,7 +3052,7 @@ export class GameEngine {
     let foundPath = false;
 
     const stepDist = speed * dt;
-    const checkDist = Math.max(stepDist * 1.5, e.radius + 0.12);
+    const checkDist = Math.max(stepDist * 1.8, e.radius + 0.16);
 
     for (const ang of testAngles) {
       const vx = Math.cos(ang) * speed;
@@ -2590,7 +3060,7 @@ export class GameEngine {
       const probeX = e.x + Math.cos(ang) * checkDist;
       const probeY = e.y + Math.sin(ang) * checkDist;
 
-      if (!this.checkWallCollision(probeX, probeY, e.radius)) {
+      if (!this.checkWallCollision(probeX, probeY, e.radius + 0.05)) {
         chosenVx = vx;
         chosenVy = vy;
         foundPath = true;
@@ -2610,19 +3080,18 @@ export class GameEngine {
     e.y = moved.y;
 
     const actualMoved = Math.hypot(e.x - prevX, e.y - prevY);
-    if (actualMoved < 0.12 * speed * dt) {
+    if (actualMoved < 0.15 * speed * dt) {
       e.stuckTimer = (e.stuckTimer || 0) + dt;
-      if (e.stuckTimer > 0.3) {
-        // Pick an escape flank angle perpendicular to desired angle
-        const sign = Math.random() < 0.5 ? 1 : -1;
-        e.unstuckNudgeAngle = Math.atan2(dy, dx) + (Math.PI / 2) * sign;
-        if (e.stuckTimer > 1.2) {
-          // Relocate safely if severely wedged
-          const safe = this.findSafeEnemySpawnPos(e.x, e.y, e.radius);
-          e.x = safe.x;
-          e.y = safe.y;
-          e.stuckTimer = 0;
-          e.unstuckNudgeAngle = undefined;
+      if (e.stuckTimer > 0.12) {
+        // Pick an escape flank angle perpendicular to obstacle and commit to it until unstuck
+        if (e.unstuckNudgeAngle === undefined) {
+          const sign = Math.random() < 0.5 ? 1 : -1;
+          e.unstuckNudgeAngle = Math.atan2(dy, dx) + (Math.PI / 2) * sign;
+        }
+        if (e.stuckTimer > 1.8) {
+          // If stuck for too long, flip flanking direction to test the other side of the obstacle
+          e.unstuckNudgeAngle = (e.unstuckNudgeAngle || 0) + Math.PI;
+          e.stuckTimer = 0.4;
         }
       }
     } else {
@@ -2633,23 +3102,63 @@ export class GameEngine {
     }
   }
 
+  // Alert Trigger with Telegraph Pause & Localized Squad Propagation
+  public triggerEnemyAlert(e: Enemy) {
+    const wasUnaware = e.state === 'idle' || e.state === 'patrol' || e.state === 'search' || e.state === 'guard';
+    if (wasUnaware) {
+      e.state = 'alert';
+      // Telegraph delay before actively rushing / engaging (0.35s to 0.70s depending on enemy archetype)
+      const alertTime = e.type === 'boss' ? 0.30 : (e.type === 'scuttler' ? 0.35 : (e.type === 'baron' ? 0.65 : (e.type === 'vile_spitter' ? 0.60 : 0.45)));
+      e.alertTimer = alertTime;
+      e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+      soundSynth.playEnemyAlert(e.type);
+      this.spawnFloatingText('!', e.x, e.y, '#ef4444', false, 20);
+
+      // Squad alert propagation: notify max 1 nearby ally within 4.5 units in same room with direct LOS
+      let alertedCount = 0;
+      for (const ally of this.mapData.enemies) {
+        if (alertedCount >= 1) break;
+        if (ally.health > 0 && ally.id !== e.id && (ally.state === 'idle' || ally.state === 'patrol' || ally.state === 'guard')) {
+          if (Math.abs(ally.x - e.x) >= 4.5 || Math.abs(ally.y - e.y) >= 4.5) continue;
+          const allyDist = Math.hypot(ally.x - e.x, ally.y - e.y);
+          if (allyDist < 4.5) {
+            const losToAlerting = this.checkLineOfSight(ally.x, ally.y, e.x, e.y);
+            const losToPlayer = this.checkLineOfSight(ally.x, ally.y, this.player.x, this.player.y);
+            if (losToAlerting || losToPlayer) {
+              alertedCount++;
+              ally.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+              if (losToPlayer) {
+                ally.state = 'alert';
+                ally.alertTimer = 0.50;
+                this.spawnFloatingText('!', ally.x, ally.y, '#f97316', false, 18);
+              } else {
+                ally.state = 'search';
+                ally.searchTimer = 2.5;
+                this.spawnFloatingText('?', ally.x, ally.y, '#facc15', false, 18);
+              }
+              ally.angle = this.smoothTurnAngle(ally.angle, Math.atan2(this.player.y - ally.y, this.player.x - ally.x), 12.0, 0.016);
+            }
+          }
+        }
+      }
+    } else if (e.state === 'search') {
+      e.state = 'chase';
+      e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+    }
+  }
+
   // --- ENEMY AI & SPAWNS ---
   private updateEnemies(dt: number) {
-    // 1. Spawning Escalation (Reinforcement waves during Boss Lockdown Arena battle)
-    if (this.isLockdown && this.boss.active && this.boss.spawned && this.mapData.enemies.filter(e => e.health > 0).length < 8) {
-      this.spawnTimer -= dt;
-      if (this.spawnTimer <= 0) {
-        this.spawnRandomEnemyWave();
-        this.spawnTimer = Math.max(3.0, 7.0 - (this.stats.kills * 0.05));
-      }
-    }
+    // 1. Boss 1-on-1 Lockdown Duel:
+    // Reinforcements are strictly disabled during boss lockdown to guarantee a fair 1-on-1 battle.
 
     // 2. Boss Special Attacks Update
     if (this.boss.active && this.boss.spawned) {
       this.updateBossBehavior(dt);
     }
 
-    // 3. Enemy-to-Enemy Soft Separation (prevents crowd-clipping and sticking)
+    // 3. Enemy-to-Enemy Soft Separation & Anti-Clustering Repulsion
+    // Keeps enemies comfortably scattered and prevents grouping up into clumps
     for (let a = 0; a < this.mapData.enemies.length; a++) {
       const e1 = this.mapData.enemies[a];
       if (e1.health <= 0) continue;
@@ -2658,10 +3167,14 @@ export class GameEngine {
         if (e2.health <= 0) continue;
         const edx = e2.x - e1.x;
         const edy = e2.y - e1.y;
+        const bodyDist = (e1.radius || 0.35) + (e2.radius || 0.35);
+        const comfortDist = bodyDist + 0.65; // Extended anti-grouping comfort separation bubble
+        if (Math.abs(edx) >= comfortDist || Math.abs(edy) >= comfortDist) continue;
         const eDist = Math.hypot(edx, edy);
-        const minDist = (e1.radius || 0.35) + (e2.radius || 0.35);
-        if (eDist > 0.001 && eDist < minDist) {
-          const overlap = (minDist - eDist) * 0.5;
+        if (eDist > 0.001 && eDist < comfortDist) {
+          // Stronger repulsion if touching, gentle repulsion in comfort zone
+          const intensity = eDist < bodyDist ? 1.0 : (1.0 - (eDist - bodyDist) / 0.65) * 0.45;
+          const overlap = (comfortDist - eDist) * 0.5 * intensity;
           const pushX = (edx / eDist) * overlap;
           const pushY = (edy / eDist) * overlap;
           if (!this.checkWallCollision(e1.x - pushX * 0.5, e1.y - pushY * 0.5, e1.radius)) {
@@ -2706,27 +3219,65 @@ export class GameEngine {
       // Guarantee depenetration and non-wall grid containment every frame
       const gx = Math.floor(e.x);
       const gy = Math.floor(e.y);
-      if (
-        gy < 1 || gy >= this.mapData.height - 1 ||
-        gx < 1 || gx >= this.mapData.width - 1 ||
-        (this.mapData.grid[gy] && this.mapData.grid[gy][gx] > 0)
-      ) {
-        const safe = this.findSafeEnemySpawnPos(e.x, e.y, e.radius);
-        e.x = safe.x;
-        e.y = safe.y;
-      } else {
-        const depen = this.resolveWallDepenetration(e.x, e.y, e.radius);
-        e.x = depen.x;
-        e.y = depen.y;
+      const isSunkenDoor = this.mapData.secrets.some(s => s.doorX === gx && s.doorY === gy && ((s.animOffset || 0) >= 0.5 || s.revealed || s.animating)) ||
+        this.mapData.airlockDoors?.some(a => a.x === gx && a.y === gy && (a.animOffset || 0) >= 0.5);
+
+      if (gy < 1 || gy >= this.mapData.height - 1 || gx < 1 || gx >= this.mapData.width - 1) {
+        // Out of global map bounds - clamp safely
+        e.x = Math.max(1.5, Math.min(this.mapData.width - 1.5, e.x));
+        e.y = Math.max(1.5, Math.min(this.mapData.height - 1.5, e.y));
       }
+
+      // Smooth continuous wall depenetration (slides enemy smoothly out of walls/corners along collision normal)
+      const depen = this.resolveWallDepenetration(e.x, e.y, e.radius);
+      e.x = depen.x;
+      e.y = depen.y;
 
       const dx = this.player.x - e.x;
       const dy = this.player.y - e.y;
       const distToPlayer = Math.hypot(dx, dy);
 
-      // Line of Sight check
-      const hasLOS = this.checkLineOfSight(e.x, e.y, this.player.x, this.player.y);
-      const detectionRange = e.isElite || e.type === 'baron' || e.type === 'boss' ? 20 : 16;
+      // Home & Sector calculations
+      const homePos = e.homePost || e.spawnOrigin || { x: e.x, y: e.y };
+      const distFromHome = Math.hypot(e.x - homePos.x, e.y - homePos.y);
+      const territoryRadius = e.territoryRadius || 5.5;
+      const isOutsideTerritory = distFromHome > territoryRadius;
+
+      // Targetability check: Player is targetable ONLY outside safe neutral zone and while game is active
+      const isPlayerTargetable = !this.inNeutralZone && !this.isGameOver && !this.isVictory;
+      const baseRange = e.isElite || e.type === 'baron' ? 10.5 : (e.type === 'boss' ? 14.0 : 8.5);
+      const isAlerted = e.state === 'chase' || e.state === 'search' || e.state === 'attack' || e.state === 'pain';
+      const detectionRange = isAlerted ? baseRange * 1.15 : baseRange;
+      const playerSpeed = Math.hypot(this.player.vx || 0, this.player.vy || 0);
+
+      // Multi-Zone FOV Perception (optimized: only raycast if inside potential sensory range):
+      let hasLOS = false;
+      let canDetectPlayer = false;
+
+      if (isPlayerTargetable && distToPlayer <= detectionRange) {
+        // Exact angle wrapping normalized to [-PI, PI]
+        const angleToPlayer = Math.atan2(dy, dx);
+        const relAngle = Math.atan2(Math.sin(angleToPlayer - e.angle), Math.cos(angleToPlayer - e.angle));
+        const absAngleDiff = Math.abs(relAngle);
+
+        let isInVisionCone = false;
+        if (isAlerted) {
+          isInVisionCone = absAngleDiff <= 1.60 && distToPlayer < detectionRange;
+        } else if (absAngleDiff <= 0.70) { // ~40 degree forward viewcone
+          isInVisionCone = distToPlayer < detectionRange;
+        } else if (absAngleDiff <= 1.25) { // Peripheral detection
+          const peripheralRange = playerSpeed > 2.5 ? detectionRange * 0.75 : detectionRange * 0.55;
+          isInVisionCone = distToPlayer < peripheralRange;
+        }
+
+        const rearTouchSense = distToPlayer < 1.35;
+        const footstepSense = playerSpeed > 3.8 && distToPlayer < 2.8;
+
+        if (isInVisionCone || rearTouchSense || footstepSense) {
+          hasLOS = this.checkLineOfSight(e.x, e.y, this.player.x, this.player.y);
+          canDetectPlayer = hasLOS;
+        }
+      }
 
       if (e.attackCooldown > 0) e.attackCooldown -= dt;
       if (e.specialStateTimer && e.specialStateTimer > 0) e.specialStateTimer -= dt;
@@ -2758,67 +3309,152 @@ export class GameEngine {
       switch (e.state) {
         case 'idle': {
           e.stateTimer -= dt;
-          // Look around
-          e.angle += Math.sin(this.gameTime * 2) * 0.02;
+          // Look around smoothly
+          const scanAngle = e.angle + Math.sin(this.gameTime * 2.2) * 0.018;
+          e.angle = this.smoothTurnAngle(e.angle, scanAngle, 3.0, dt);
 
-          // Sensory Perception: direct sight or acoustic proximity
-          if ((hasLOS && distToPlayer < detectionRange) || distToPlayer < 3.5) {
-            e.state = 'chase';
-            e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-            soundSynth.playEnemyAlert(e.type);
+          if (canDetectPlayer) {
+            this.triggerEnemyAlert(e);
           } else if (e.stateTimer <= 0) {
             e.state = 'patrol';
-            e.patrolTarget = this.findPatrolWaypoint(e.x, e.y, e.spawnOrigin);
-            e.patrolTimer = 3.5 + Math.random() * 3.0;
+            if (!e.patrolWaypoints || e.patrolWaypoints.length === 0) {
+              e.patrolWaypoints = this.generatePatrolRoute(e);
+              e.waypointIndex = 0;
+            }
+            e.patrolTimer = 4.0 + Math.random() * 2.5;
+          }
+          break;
+        }
+
+        case 'guard': {
+          // Guard state: Enemy holds their post at the sector perimeter / doorway
+          e.guardTimer = (e.guardTimer !== undefined ? e.guardTimer : 2.5) - dt;
+          const targetAng = e.guardAngle !== undefined ? e.guardAngle : (e.lastSeenPlayerPos ? Math.atan2(e.lastSeenPlayerPos.y - e.y, e.lastSeenPlayerPos.x - e.x) : e.angle);
+          e.angle = this.smoothTurnAngle(e.angle, targetAng, 6.0, dt);
+          e.animFrame = 0;
+
+          if (canDetectPlayer && distFromHome <= territoryRadius + 1.5) {
+            this.triggerEnemyAlert(e);
+            break;
+          }
+
+          if (e.guardTimer <= 0) {
+            // Revert to patrolling own sector
+            e.state = 'patrol';
+            e.patrolWaypoints = this.generatePatrolRoute(e);
+            e.waypointIndex = 0;
+            e.patrolTimer = 4.0 + Math.random() * 2.5;
           }
           break;
         }
 
         case 'patrol': {
-          // Sensory Perception: direct sight or acoustic proximity
-          if ((hasLOS && distToPlayer < detectionRange) || distToPlayer < 3.5) {
-            e.state = 'chase';
-            e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-            soundSynth.playEnemyAlert(e.type);
+          if (canDetectPlayer) {
+            this.triggerEnemyAlert(e);
             break;
           }
 
-          e.patrolTimer = (e.patrolTimer || 3.0) - dt;
-          if (!e.patrolTarget || e.patrolTimer <= 0) {
-            e.state = 'idle';
-            e.stateTimer = 1.5 + Math.random() * 2.0;
-            break;
+          if (!e.patrolWaypoints || e.patrolWaypoints.length === 0) {
+            e.patrolWaypoints = this.generatePatrolRoute(e);
+            e.waypointIndex = 0;
           }
 
-          const ptx = e.patrolTarget.x - e.x;
-          const pty = e.patrolTarget.y - e.y;
+          const waypoints = e.patrolWaypoints;
+          const idx = e.waypointIndex || 0;
+          const currentWp = waypoints[idx] || homePos;
+
+          e.patrolTimer = (e.patrolTimer || 4.0) - dt;
+          
+          const ptx = currentWp.x - e.x;
+          const pty = currentWp.y - e.y;
           const ptDist = Math.hypot(ptx, pty);
 
-          if (ptDist < 0.6) {
-            // Reached waypoint! Pause and look around
+          if (ptDist < 0.65 || e.patrolTimer <= 0) {
+            // Reached waypoint or timer expired: advance to next room waypoint and pause to observe
+            e.waypointIndex = (idx + 1) % waypoints.length;
             e.state = 'idle';
-            e.stateTimer = 1.5 + Math.random() * 2.0;
+            e.stateTimer = 1.8 + Math.random() * 2.0;
+            e.patrolTimer = 4.0 + Math.random() * 2.5;
           } else {
-            e.angle = Math.atan2(pty, ptx);
+            const targetAngle = Math.atan2(pty, ptx);
+            e.angle = this.smoothTurnAngle(e.angle, targetAngle, 7.5, dt);
             const patrolSpeed = e.speed * 0.45;
-            this.steerEnemySmartly(e, e.patrolTarget.x, e.patrolTarget.y, patrolSpeed, dt);
+            this.steerEnemySmartly(e, currentWp.x, currentWp.y, patrolSpeed, dt);
             e.animFrame = Math.floor(this.gameTime * 3.5) % 2;
           }
           break;
         }
 
+        case 'alert': {
+          // Alert telegraph stance: Enemy spots player, smoothly locks orientation toward player, but DOES NOT immediately rush
+          const targetAngle = Math.atan2(dy, dx);
+          e.angle = this.smoothTurnAngle(e.angle, targetAngle, 14.0, dt);
+          e.animFrame = 0;
+          e.alertTimer = (e.alertTimer !== undefined ? e.alertTimer : 0.5) - dt;
+
+          if (!isPlayerTargetable) {
+            e.state = 'guard';
+            e.guardTimer = 2.0;
+            e.guardAngle = e.angle;
+            break;
+          }
+
+          if (e.alertTimer <= 0) {
+            e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+            if (hasLOS) {
+              e.state = 'chase';
+            } else {
+              e.state = 'search';
+              e.searchTimer = 3.0;
+            }
+          }
+          break;
+        }
+
         case 'chase': {
-          e.angle = Math.atan2(dy, dx);
+          // If player is no longer targetable, revert to guard / patrol
+          if (!isPlayerTargetable) {
+            e.state = 'guard';
+            e.guardTimer = 2.0;
+            e.guardAngle = e.angle;
+            break;
+          }
+
+          const targetAngle = Math.atan2(dy, dx);
+          e.angle = this.smoothTurnAngle(e.angle, targetAngle, 16.0, dt);
 
           // If player has broken line of sight (ducked behind wall/corner), switch to search
           if (!hasLOS) {
             e.state = 'search';
-            e.searchTimer = 4.5;
+            e.searchTimer = 3.0;
             break;
           }
 
           // Player is spotted: refresh last known position
           e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
+
+          // --- SECTOR HOLDING & TERRITORIAL LEASH ENFORCEMENT ---
+          // Non-boss enemies strictly defend their assigned sector and don't rush across the whole base
+          if (e.type !== 'boss' && isOutsideTerritory) {
+            // If enemy reached the sector perimeter/doorway:
+            if (e.type === 'scuttler' || e.type === 'lost_soul') {
+              // Melee rusher breaks off if player moved beyond its territory
+              if (distToPlayer > 4.5 || distFromHome > territoryRadius + 1.8) {
+                e.state = 'guard';
+                e.guardTimer = 2.0;
+                e.guardAngle = Math.atan2(homePos.y - e.y, homePos.x - e.x);
+                break;
+              }
+            } else {
+              // Ranged enemies anchor at the sector boundary / doorway to provide suppressive fire
+              if (distToPlayer > 12.0) {
+                e.state = 'guard';
+                e.guardTimer = 2.5;
+                e.guardAngle = targetAngle;
+                break;
+              }
+            }
+          }
 
           const isEnraged = (e.type === 'baron' && e.health < e.maxHealth * 0.5) || e.isElite;
           let spd = e.speed * (isEnraged ? 1.35 : 1.0);
@@ -2826,15 +3462,18 @@ export class GameEngine {
           let flankAngle = 0;
           let keepDistance = 0;
 
+          // Unique lane angle dispersion per enemy ID so multiple enemies fan out around the player
+          const laneOffset = ((e.id % 5) - 2) * 0.22; // -0.44, -0.22, 0, +0.22, +0.44
+
           if (e.type === 'grunt') {
             keepDistance = 3.8;
-            flankAngle = (e.strafeDir || 1) * 0.35;
+            flankAngle = (e.strafeDir || 1) * 0.35 + laneOffset;
           } else if (e.type === 'imp') {
             keepDistance = 5.0;
-            flankAngle = (e.strafeDir || 1) * 0.4;
+            flankAngle = (e.strafeDir || 1) * 0.4 + laneOffset;
           } else if (e.type === 'scuttler') {
             // Fast zig-zag predator flanking & leaping
-            flankAngle = Math.sin(this.gameTime * 12 + e.id) * 0.65;
+            flankAngle = Math.sin(this.gameTime * 12 + e.id) * 0.65 + laneOffset;
             // Check leap pounce when closing in
             if (distToPlayer < 3.6 && (!e.specialStateTimer || e.specialStateTimer <= 0)) {
               spd *= 2.2;
@@ -2844,28 +3483,34 @@ export class GameEngine {
           } else if (e.type === 'plasma_gunner') {
             // Tactical standoff kiting & circle-strafing
             keepDistance = 6.8;
-            flankAngle = (e.strafeDir || 1) * 0.75;
+            flankAngle = (e.strafeDir || 1) * 0.75 + laneOffset;
           } else if (e.type === 'vile_spitter') {
             // Heavy artillery bio-mortar positioning
             keepDistance = 9.5;
-            flankAngle = Math.sin(this.gameTime * 2.5 + e.id) * 0.5;
+            flankAngle = Math.sin(this.gameTime * 2.5 + e.id) * 0.5 + laneOffset;
           } else if (e.type === 'lost_soul') {
-            flankAngle = Math.sin(this.gameTime * 6) * 0.45;
+            flankAngle = Math.sin(this.gameTime * 6) * 0.45 + laneOffset;
           } else if (e.type === 'baron') {
-            flankAngle = 0; // Inexorable direct march
+            flankAngle = laneOffset * 0.5; // Inexorable direct march with slight angular spread
           } else if (e.type === 'boss') {
             keepDistance = 4.5;
             flankAngle = Math.sin(this.gameTime * 2.5) * 0.4;
           }
 
-          this.steerEnemySmartly(e, this.player.x, this.player.y, spd, dt, flankAngle, keepDistance);
+          // If holding sector boundary, steer toward sector edge rather than diving deep into other rooms
+          if (e.type !== 'boss' && isOutsideTerritory && hasLOS) {
+            // Hold ground & strafe at perimeter
+            this.steerEnemySmartly(e, homePos.x, homePos.y, spd * 0.4, dt, (e.strafeDir || 1) * 0.6, 2.0);
+          } else {
+            this.steerEnemySmartly(e, this.player.x, this.player.y, spd, dt, flankAngle, keepDistance);
+          }
 
           e.animFrame = Math.floor(this.gameTime * 5) % 2;
 
           // Attack Trigger
           const maxAttackDist =
             e.type === 'scuttler'
-              ? 1.45
+              ? 1.85
               : e.type === 'plasma_gunner'
               ? 18.0
               : e.type === 'vile_spitter'
@@ -2899,37 +3544,53 @@ export class GameEngine {
         }
 
         case 'search': {
-          // If player re-enters line of sight, immediately resume aggressive chase
-          if (hasLOS && distToPlayer < detectionRange) {
-            e.state = 'chase';
-            e.lastSeenPlayerPos = { x: this.player.x, y: this.player.y };
-            soundSynth.playEnemyAlert(e.type);
+          // If player is untargetable, return to guard / patrol
+          if (!isPlayerTargetable) {
+            e.state = 'guard';
+            e.guardTimer = 2.0;
+            e.guardAngle = e.angle;
             break;
           }
 
-          e.searchTimer = (e.searchTimer || 4.5) - dt;
+          // If player re-enters line of sight or proximity within sector limits, immediately resume chase
+          if (canDetectPlayer && distFromHome <= territoryRadius + 1.5) {
+            this.triggerEnemyAlert(e);
+            break;
+          }
+
+          // If enemy wandered too far from home during search, abort and guard
+          if (e.type !== 'boss' && distFromHome > territoryRadius + 1.5) {
+            e.state = 'guard';
+            e.guardTimer = 2.5;
+            e.guardAngle = Math.atan2(homePos.y - e.y, homePos.x - e.x);
+            break;
+          }
+
+          e.searchTimer = (e.searchTimer || 3.0) - dt;
           if (e.searchTimer <= 0) {
-            // Target lost completely, return to patrol
-            e.state = 'patrol';
-            e.patrolTarget = this.findPatrolWaypoint(e.x, e.y, e.spawnOrigin);
-            e.patrolTimer = 3.5 + Math.random() * 3.0;
+            // Target lost completely, hold guard briefly then patrol home
+            e.state = 'guard';
+            e.guardTimer = 2.0;
+            e.guardAngle = e.angle;
             break;
           }
 
-          // Aggressively hunt towards last seen spot with intelligent steering
+          // Hunt towards last seen spot with intelligent steering
           if (e.lastSeenPlayerPos) {
             const sx = e.lastSeenPlayerPos.x - e.x;
             const sy = e.lastSeenPlayerPos.y - e.y;
             const sDist = Math.hypot(sx, sy);
 
             if (sDist > 0.8) {
-              e.angle = Math.atan2(sy, sx);
+              const targetAngle = Math.atan2(sy, sx);
+              e.angle = this.smoothTurnAngle(e.angle, targetAngle, 12.0, dt);
               const searchSpd = e.speed * 0.92;
               this.steerEnemySmartly(e, e.lastSeenPlayerPos.x, e.lastSeenPlayerPos.y, searchSpd, dt);
               e.animFrame = Math.floor(this.gameTime * 5) % 2;
             } else {
-              // Reached corner: actively sweep vision searching for player
-              e.angle += Math.sin(this.gameTime * 4) * 0.06;
+              // Reached corner: actively sweep vision cone searching for player
+              const sweepAngle = Math.atan2(sy, sx) + Math.sin(this.gameTime * 4) * 0.75;
+              e.angle = this.smoothTurnAngle(e.angle, sweepAngle, 8.0, dt);
               e.animFrame = 0;
             }
           }
@@ -3102,6 +3763,42 @@ export class GameEngine {
         this.damagePlayer(24, e.x, e.y);
         soundSynth.playFleshHit();
       }
+    } else if (e.type === 'boss') {
+      // 1-on-1 Boss Tactical Attacks
+      const diffDmgMult = this.difficulty === 'easy' ? 0.75 : (this.difficulty === 'hard' ? 1.25 : (this.difficulty === 'nightmare' ? 1.5 : 1.0));
+      if (distToPlayer < 2.3) {
+        // Devastating close-range ground slam / titan smash
+        soundSynth.playHeavyImpactCrunch();
+        this.damagePlayer(Math.round(28 * diffDmgMult), e.x, e.y);
+        this.player.screenShake = Math.max(this.player.screenShake, 7);
+        this.particles.spawnSparks(e.x, e.y, 0.6, '#ef4444', 16);
+      } else {
+        // Heavy twin plasma volley with predictive aim
+        soundSynth.playFireballLaunch();
+        const pSpeed = this.difficulty === 'easy' ? 9.5 : (this.difficulty === 'hard' ? 12.0 : (this.difficulty === 'nightmare' ? 13.0 : 10.5));
+        const leadTime = Math.min(0.45, distToPlayer / pSpeed);
+        const predX = this.player.x + pVx * leadTime * 0.7;
+        const predY = this.player.y + pVy * leadTime * 0.7;
+        const baseAimAngle = Math.atan2(predY - e.y, predX - e.x);
+        [-0.15, 0.15].forEach((offset) => {
+          const ang = baseAimAngle + offset;
+          this.projectiles.push({
+            id: this.nextProjId++,
+            x: e.x + Math.cos(ang) * 0.6,
+            y: e.y + Math.sin(ang) * 0.6,
+            z: 0.5,
+            vx: Math.cos(ang) * pSpeed,
+            vy: Math.sin(ang) * pSpeed,
+            vz: 0,
+            damage: Math.round(24 * diffDmgMult),
+            radius: 0.32,
+            fromPlayer: false,
+            type: 'plasma_green',
+            life: 0,
+            maxLife: 4.0,
+          });
+        });
+      }
     }
   }
 
@@ -3109,14 +3806,54 @@ export class GameEngine {
     const boss = this.mapData.enemies.find(e => e.type === 'boss');
     if (!boss || boss.health <= 0) return;
 
+    // Dynamic Boss Phase Tracking
+    const hpPct = Math.max(0, boss.health / boss.maxHealth);
+    const oldPhase = this.boss.phase || 1;
+    let currentPhase = 1;
+    if (hpPct <= 0.30) {
+      currentPhase = 3;
+    } else if (hpPct <= 0.65) {
+      currentPhase = 2;
+    }
+
+    if (currentPhase > oldPhase) {
+      this.boss.phase = currentPhase;
+      soundSynth.playBossAlarm();
+      this.player.damageFlash = 0.3;
+      if (currentPhase === 2) {
+        this.spawnFloatingText(`⚡ ${this.boss.name} // PHASE II: OVERDRIVE! ⚡`, boss.x, boss.y, '#f59e0b', true, 24);
+        this.particles.spawnSparks(boss.x, boss.y, 0.8, '#f59e0b', 28);
+      } else if (currentPhase === 3) {
+        this.spawnFloatingText(`☠️ ${this.boss.name} // PHASE III: APOCALYPTIC ENRAGE! ☠️`, boss.x, boss.y, '#ef4444', true, 26);
+        this.particles.spawnSparks(boss.x, boss.y, 1.0, '#ef4444', 36);
+      }
+    }
+
+    // Ambient Boss Aura Particle Emission based on stage & phase
+    if (Math.random() < (currentPhase === 3 ? 0.75 : (currentPhase === 2 ? 0.50 : 0.28))) {
+      const stage = this.currentStage;
+      if (stage === 1) {
+        this.particles.spawnSparks(boss.x + (Math.random() - 0.5) * 0.8, boss.y + (Math.random() - 0.5) * 0.8, 0.4 + Math.random() * 0.4, '#38bdf8', 2);
+      } else if (stage === 2) {
+        this.particles.spawnSparks(boss.x + (Math.random() - 0.5) * 0.8, boss.y + (Math.random() - 0.5) * 0.8, 0.3 + Math.random() * 0.4, '#22c55e', 3);
+      } else if (stage === 3) {
+        this.particles.spawnSparks(boss.x + (Math.random() - 0.5) * 0.8, boss.y + (Math.random() - 0.5) * 0.8, 0.4 + Math.random() * 0.5, '#f97316', 3);
+      } else {
+        this.particles.spawnSparks(boss.x + (Math.random() - 0.5) * 0.8, boss.y + (Math.random() - 0.5) * 0.8, 0.4 + Math.random() * 0.5, '#c084fc', 3);
+      }
+    }
+
     this.boss.specialAttackCooldown -= dt;
     if (this.boss.specialAttackCooldown <= 0) {
-      this.boss.specialAttackCooldown = this.boss.isUltra ? 3.0 : 4.2;
+      const baseCd = this.boss.isUltra ? (currentPhase === 3 ? 2.0 : 2.8) : (currentPhase === 3 ? 2.5 : (currentPhase === 2 ? 3.2 : 4.0));
+      const cdMult = this.difficulty === 'easy' ? 1.35 : (this.difficulty === 'hard' ? 0.85 : (this.difficulty === 'nightmare' ? 0.70 : 1.0));
+      this.boss.specialAttackCooldown = +(baseCd * cdMult).toFixed(2);
       const roll = Math.random();
 
-      if (this.boss.isUltra && roll < 0.35) {
+      if (this.boss.isUltra && roll < 0.40) {
         // Ultra Boss Attack 1: 8-Way Apocalypse Nova
         soundSynth.playPlasmaRifle();
+        const novaSpeed = this.difficulty === 'easy' ? 8.0 : (this.difficulty === 'hard' ? 11.0 : (this.difficulty === 'nightmare' ? 12.0 : 9.5));
         for (let a = 0; a < 8; a++) {
           const ang = (Math.PI * 2 / 8) * a + (this.gameTime % Math.PI);
           this.projectiles.push({
@@ -3124,10 +3861,10 @@ export class GameEngine {
             x: boss.x + Math.cos(ang) * 0.7,
             y: boss.y + Math.sin(ang) * 0.7,
             z: 0.5,
-            vx: Math.cos(ang) * 9.5,
-            vy: Math.sin(ang) * 9.5,
+            vx: Math.cos(ang) * novaSpeed,
+            vy: Math.sin(ang) * novaSpeed,
             vz: 0,
-            damage: 28,
+            damage: this.difficulty === 'easy' ? 20 : (this.difficulty === 'hard' ? 32 : (this.difficulty === 'nightmare' ? 38 : 26)),
             radius: 0.32,
             fromPlayer: false,
             type: 'plasma_green',
@@ -3136,10 +3873,10 @@ export class GameEngine {
           });
         }
         this.spawnFloatingText('💥 8-WAY APOCALYPSE NOVA! 💥', boss.x, boss.y, '#22c55e', true);
-      } else if (roll < 0.68) {
-        // Rocket Barrage (spread of 5 rockets for Ultra Boss, 3 for regular boss)
+      } else if (this.currentStage === 2 && roll < 0.50) {
+        // Stage 2 Boss: Toxic Slag Barrage (spread of 4 toxic green acidic mortars)
         soundSynth.playExplosion();
-        const spreads = this.boss.isUltra ? [-0.36, -0.18, 0, 0.18, 0.36] : [-0.22, 0, 0.22];
+        const spreads = [-0.30, -0.10, 0.10, 0.30];
         spreads.forEach((angOff) => {
           const ang = boss.angle + angOff;
           this.projectiles.push({
@@ -3147,10 +3884,35 @@ export class GameEngine {
             x: boss.x + Math.cos(ang) * 0.6,
             y: boss.y + Math.sin(ang) * 0.6,
             z: 0.5,
-            vx: Math.cos(ang) * 11.0,
-            vy: Math.sin(ang) * 11.0,
+            vx: Math.cos(ang) * 9.5,
+            vy: Math.sin(ang) * 9.5,
             vz: 0,
-            damage: 35,
+            damage: 26,
+            radius: 0.35,
+            fromPlayer: false,
+            type: 'plasma_green',
+            life: 0,
+            maxLife: 4.0,
+          });
+        });
+        this.spawnFloatingText('☣️ TOXIC SLAG BARRAGE! ☣️', boss.x, boss.y, '#22c55e', true);
+      } else if (roll < 0.68) {
+        // Rocket Barrage (spread of 5 rockets for Ultra Boss, 3 for regular boss)
+        soundSynth.playExplosion();
+        const spreads = this.boss.isUltra ? [-0.36, -0.18, 0, 0.18, 0.36] : [-0.22, 0, 0.22];
+        const rSpeed = this.difficulty === 'easy' ? 9.0 : (this.difficulty === 'hard' ? 12.0 : (this.difficulty === 'nightmare' ? 13.5 : 10.5));
+        const rDmg = this.difficulty === 'easy' ? 25 : (this.difficulty === 'hard' ? 40 : (this.difficulty === 'nightmare' ? 48 : 32));
+        spreads.forEach((angOff) => {
+          const ang = boss.angle + angOff;
+          this.projectiles.push({
+            id: this.nextProjId++,
+            x: boss.x + Math.cos(ang) * 0.6,
+            y: boss.y + Math.sin(ang) * 0.6,
+            z: 0.5,
+            vx: Math.cos(ang) * rSpeed,
+            vy: Math.sin(ang) * rSpeed,
+            vz: 0,
+            damage: rDmg,
             radius: 0.35,
             fromPlayer: false,
             type: 'rocket',
@@ -3158,11 +3920,11 @@ export class GameEngine {
             maxLife: 4.0,
           });
         });
-        this.spawnFloatingText(this.boss.isUltra ? '⚠️ ULTRA MISSILE STORM! ⚠️' : '⚠️ TITAN ROCKET BARRAGE! ⚠️', boss.x, boss.y, '#ef4444', true);
+        this.spawnFloatingText(this.boss.isUltra ? '⚠️ ULTRA MISSILE STORM! ⚠️' : (this.currentStage === 3 ? '🔥 HELLFIRE BARRAGE! 🔥' : '⚠️ TITAN ROCKET BARRAGE! ⚠️'), boss.x, boss.y, '#ef4444', true);
       } else {
-        // Shield Phase
+        // Shield Phase (shorter on Easy, longer on Nightmare)
         this.boss.shieldActive = true;
-        this.boss.shieldTimer = this.boss.isUltra ? 2.5 : 3.0;
+        this.boss.shieldTimer = this.difficulty === 'easy' ? 1.8 : (this.difficulty === 'nightmare' ? 3.5 : (this.boss.isUltra ? 2.5 : 2.8));
         soundSynth.playWeaponSwitch();
         this.spawnFloatingText('🛡️ KINETIC SHIELD ENGAGED! 🛡️', boss.x, boss.y, '#38bdf8', true);
       }
@@ -3176,81 +3938,6 @@ export class GameEngine {
     }
   }
 
-  private spawnRandomEnemyWave() {
-    const eliteChance = this.difficulty === 'easy' ? 0.08 : (this.difficulty === 'normal' ? 0.22 : (this.difficulty === 'hard' ? 0.4 : 0.6));
-    const isElite = Math.random() < eliteChance;
-    
-    // Tiered escalating enemy pool strictly locked by current stage
-    let pool: Enemy['type'][] = ['grunt', 'scuttler', 'imp'];
-    if (this.currentStage === 1) {
-      // Level 1 strictly spawns only Imps, Grunts, and Scuttlers
-      pool = ['grunt', 'scuttler', 'imp'];
-    } else if (this.currentStage === 2) {
-      // Level 2 introduces Vile Spitters and Plasma Gunners
-      pool = ['grunt', 'scuttler', 'imp', 'vile_spitter', 'plasma_gunner'];
-    } else if (this.currentStage === 3) {
-      // Level 3 introduces Demonic Barons of Hell and Lost Souls
-      pool = ['imp', 'scuttler', 'vile_spitter', 'plasma_gunner', 'lost_soul', 'baron'];
-    } else {
-      // Level 4: Endgame demonic horde
-      pool = ['plasma_gunner', 'vile_spitter', 'baron', 'lost_soul', 'scuttler'];
-    }
-
-    const type = pool[Math.floor(Math.random() * pool.length)];
-
-    let radius = 0.35;
-    if (type === 'baron') radius = 0.45;
-    else if (type === 'vile_spitter') radius = 0.44;
-    else if (type === 'plasma_gunner') radius = 0.38;
-    else if (type === 'scuttler' || type === 'lost_soul') radius = 0.32;
-
-    const pos = this.findSafeEnemySpawnPos(undefined, undefined, radius);
-
-    let health = 40;
-    if (type === 'baron') health = 220;
-    else if (type === 'vile_spitter') health = 140;
-    else if (type === 'plasma_gunner') health = 90;
-    else if (type === 'imp') health = 70;
-    else if (type === 'scuttler') health = 55;
-    else if (type === 'lost_soul') health = 45;
-
-    const diffHpMult = this.difficulty === 'easy' ? 0.75 : (this.difficulty === 'hard' ? 1.25 : (this.difficulty === 'nightmare' ? 1.5 : 1.0));
-    const speedMult = this.difficulty === 'easy' ? 0.85 : (this.difficulty === 'hard' ? 1.18 : (this.difficulty === 'nightmare' ? 1.38 : 1.0));
-    const cdMult = this.difficulty === 'easy' ? 1.35 : (this.difficulty === 'hard' ? 0.82 : (this.difficulty === 'nightmare' ? 0.68 : 1.0));
-
-    let baseSpeed = 2.2 * speedMult;
-    if (type === 'scuttler') baseSpeed = 5.4 * speedMult;
-    else if (type === 'lost_soul') baseSpeed = 4.5 * speedMult;
-    else if (type === 'plasma_gunner') baseSpeed = 3.2 * speedMult;
-    else if (type === 'imp') baseSpeed = 2.6 * speedMult;
-    else if (type === 'baron') baseSpeed = 2.4 * speedMult;
-    else if (type === 'vile_spitter') baseSpeed = 2.1 * speedMult;
-
-    const finalHp = Math.round(health * diffHpMult * (isElite ? 1.5 : 1.0));
-
-    this.mapData.enemies.push({
-      id: Date.now() + Math.random(),
-      type,
-      x: pos.x,
-      y: pos.y,
-      z: 0,
-      vx: 0,
-      vy: 0,
-      angle: Math.random() * Math.PI * 2,
-      health: finalHp,
-      maxHealth: finalHp,
-      state: 'patrol',
-      stateTimer: 1.5 + Math.random() * 2.0,
-      patrolTimer: 3.0 + Math.random() * 3.0,
-      animFrame: 0,
-      speed: baseSpeed,
-      attackCooldown: +(1.4 * cdMult).toFixed(2),
-      isElite,
-      radius,
-      spawnOrigin: { x: pos.x, y: pos.y },
-    });
-  }
-
   private checkLineOfSight(x1: number, y1: number, x2: number, y2: number): boolean {
     const dist = Math.hypot(x2 - x1, y2 - y1);
     const steps = Math.ceil(dist / 0.25);
@@ -3260,8 +3947,23 @@ export class GameEngine {
     for (let s = 1; s < steps; s++) {
       const tx = Math.floor(x1 + dx * s);
       const ty = Math.floor(y1 + dy * s);
+
+      if (ty < 0 || ty >= this.mapData.height || tx < 0 || tx >= this.mapData.width) {
+        return false;
+      }
+
       if (this.mapData.grid[ty] && this.mapData.grid[ty][tx] > 0) {
         return false;
+      }
+
+      // If airlock doors are not fully open, block line-of-sight across the airlock threshold
+      if (this.airlockState !== 'open' && this.mapData.airlockDoors) {
+        for (let di = 0; di < this.mapData.airlockDoors.length; di++) {
+          const ad = this.mapData.airlockDoors[di];
+          if (ty === ad.y && tx === ad.x) {
+            return false;
+          }
+        }
       }
     }
     return true;
@@ -3275,6 +3977,18 @@ export class GameEngine {
 
       const dist = Math.hypot(pk.x - this.player.x, pk.y - this.player.y);
       if (dist < 0.65) {
+        // Prevent picking up items through walls or closed secret doors
+        if (!this.checkLineOfSight(this.player.x, this.player.y, pk.x, pk.y)) {
+          continue;
+        }
+
+        // If pickup is inside a secret area that hasn't been unsealed yet, prevent collection
+        const isBehindClosedSecret = this.mapData.secrets.some(s => {
+          if (s.revealed && (s.animOffset || 0) >= 0.7) return false;
+          return Math.hypot(pk.x - (s.doorX + 0.5), pk.y - (s.doorY + 0.5)) < 2.5;
+        });
+        if (isBehindClosedSecret) continue;
+
         let collected = false;
 
         if (pk.type === 'medkit_small' && this.player.health < this.player.maxHealth) {
@@ -3325,6 +4039,12 @@ export class GameEngine {
           this.player.health = Math.max(100, this.player.health);
           soundSynth.playBerserkRage();
           this.spawnFloatingText('🔥 BERSERK RAGE ACTIVATED! 🔥', 0, 0, '#ef4444', false, 24);
+          collected = true;
+        } else if (pk.type === 'infinite_dash_relic') {
+          this.player.infiniteDashTimer = 15.0;
+          this.player.dash.cooldown = 0;
+          soundSynth.playRelicPickup();
+          this.spawnFloatingText('⚡ CHRONO-HASTE RELIC ACTIVATED: ZERO-COOLDOWN DASH! ⚡', 0, 0, '#38bdf8', false, 24);
           collected = true;
         }
 

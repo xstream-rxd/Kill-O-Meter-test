@@ -5,8 +5,10 @@ import { TextureManager } from '../engine/textures';
 import { GameSettings } from '../types';
 import { Minimap } from './Minimap';
 import { DoomHud } from './DoomHud';
+import { SectorDebriefModal } from './SectorDebriefModal';
 import { soundSynth } from '../engine/soundSynth';
-import { AlertTriangle, Play, Compass, Flame, Trophy } from 'lucide-react';
+import { gamepadManager } from '../engine/gamepadManager';
+import { AlertTriangle, Play, Compass, Flame, Trophy, Gamepad2 } from 'lucide-react';
 
 interface GameCanvasProps {
   engine: GameEngine;
@@ -27,9 +29,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const [hitmarker, setHitmarker] = useState(false);
   const [lookDirection, setLookDirection] = useState<'left' | 'right' | 'straight'>('straight');
   const [isAutomapOpen, setIsAutomapOpen] = useState(false);
+  const [gamepadNotification, setGamepadNotification] = useState<{ name: string; type: 'connected' | 'disconnected' } | null>(null);
+  const [isGamepadConnected, setIsGamepadConnected] = useState(false);
 
   const keysPressed = useRef<Record<string, boolean>>({});
   const lastTimeRef = useRef<number>(performance.now());
+  const isGamepadActiveRef = useRef(false);
   const raycasterRef = useRef<RaycasterEngine>(new RaycasterEngine());
   const texturesRef = useRef<TextureManager>(TextureManager.getInstance());
   const prevKillsRef = useRef<number>(0);
@@ -41,6 +46,17 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const weaponSwayXRef = useRef<number>(0);
   const strafeTiltRef = useRef<number>(0);
   const lastPauseTimeRef = useRef<number>(0);
+
+  // Gamepad Notification Listener
+  useEffect(() => {
+    return gamepadManager.onNotification((notif) => {
+      setGamepadNotification({ name: notif.name, type: notif.type });
+      setIsGamepadConnected(notif.type === 'connected');
+      setTimeout(() => {
+        setGamepadNotification((cur) => (cur?.name === notif.name ? null : cur));
+      }, 3500);
+    });
+  }, []);
 
   // Setup Keyboard Listeners
   useEffect(() => {
@@ -102,9 +118,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         engine.executeGloryKill();
       }
 
-      // Interact / Secret Trigger (KeyE / kb.interact)
+      // Interact / Secret Trigger / Debrief Advance (KeyE / kb.interact)
       if (e.code === kb.interact || e.code === 'KeyE') {
-        engine.interact();
+        if (engine.levelTransition.active && engine.levelTransition.isDebriefWaiting) {
+          engine.confirmLevelTransition();
+        } else {
+          engine.interact();
+        }
       }
 
       // Diegetic Weapon Inspect (KeyI / KeyT)
@@ -209,7 +229,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         lastLockExitRef.current = performance.now();
       }
     }
-  }, [engine.isGameOver, engine.isVictory, engine.isPaused, isAutomapOpen]);
+  }, [engine.isGameOver, engine.isVictory, engine.isPaused, engine.isMutating, isAutomapOpen]);
 
   useEffect(() => {
     const handlePointerLockChange = () => {
@@ -217,8 +237,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       setIsPointerLocked(isLocked);
       if (!isLocked) {
         lastLockExitRef.current = performance.now();
-        // Automatically pause game and open Pause Menu if pointer lock is exited while playing
-        if (!engine.isPaused && !engine.isGameOver && !engine.isVictory && !engine.isMutating) {
+        // Automatically pause game if pointer lock is exited while playing (unless using gamepad)
+        if (!isGamepadActiveRef.current && !engine.isPaused && !engine.isGameOver && !engine.isVictory && !engine.isMutating) {
           lastPauseTimeRef.current = performance.now();
           onTogglePause();
         }
@@ -336,6 +356,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               projectiles: engine.projectiles,
               pickups: engine.mapData.pickups,
               chests: engine.mapData.chests,
+              secrets: engine.mapData.secrets,
+              airlockDoors: engine.mapData.airlockDoors,
+              airlockAnimProgress: engine.airlockAnimProgress,
               particles: engine.particles,
               flashLight: engine.player.weaponAnim.muzzleFlash ? 0.2 : (engine.isLockdown ? 0.2 : 0),
               isLockdown: engine.isLockdown,
@@ -361,19 +384,125 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         }
       }
 
-      // Input vectors
+      // Gamepad Input Polling
+      const pad = gamepadManager.poll({
+        deadzone: settings.gamepadDeadzone ?? 0.15,
+        invertY: settings.gamepadInvertY ?? false,
+        dt,
+      });
+
+      if (pad.connected) {
+        if (!isGamepadConnected) {
+          setIsGamepadConnected(true);
+        }
+        isGamepadActiveRef.current = true;
+
+        // Gamepad Pause / Resume Toggle
+        if (pad.justPause) {
+          onTogglePause();
+          return;
+        }
+
+        // Gamepad Automap Overlay Toggle
+        if (pad.justAutomap) {
+          setIsAutomapOpen((prev) => !prev);
+        }
+
+        // Gamepad Minimap Toggle
+        if (pad.justMinimap && onToggleMinimap) {
+          onToggleMinimap();
+        }
+
+        // Gamepad Single Fire
+        if (pad.justFire) {
+          engine.fireWeapon();
+        }
+
+        // Gamepad Dash
+        if (pad.justDash) {
+          engine.triggerDash(pad.moveY || 1, pad.moveX || 0);
+        }
+
+        // Gamepad Interact (consoles, secrets, supply chests, debrief modal)
+        if (pad.justInteract) {
+          if (engine.levelTransition.active && engine.levelTransition.isDebriefWaiting) {
+            engine.confirmLevelTransition();
+          } else {
+            engine.interact();
+          }
+        }
+
+        // Gamepad Reload
+        if (pad.justReload) {
+          engine.reloadWeapon();
+        }
+
+        // Gamepad Glory Kill / Melee
+        if (pad.justGloryKill) {
+          engine.executeGloryKill();
+        }
+
+        // Gamepad Weapon Cycling & Direct Slots
+        if (pad.justNextWeapon) {
+          engine.cycleWeapon(1);
+        } else if (pad.justPrevWeapon) {
+          engine.cycleWeapon(-1);
+        } else if (pad.directWeaponSlot !== null) {
+          const types: ('fist' | 'pistol' | 'shotgun' | 'chaingun' | 'plasma')[] = [
+            'fist',
+            'pistol',
+            'shotgun',
+            'chaingun',
+            'plasma',
+          ];
+          engine.switchWeapon(types[pad.directWeaponSlot - 1]);
+        }
+
+        // Gamepad Weapon Inspect
+        if (pad.justInspect) {
+          engine.triggerInspect();
+        }
+
+        // Gamepad Analog Look (Right Stick)
+        if (Math.abs(pad.lookX) > 0.01) {
+          const lookSens = (settings.gamepadSensitivity || 2.2) * 2.8;
+          engine.player.angle += pad.lookX * lookSens * dt;
+          mouseInertiaXRef.current += pad.lookX * 16 * dt;
+
+          if (pad.lookX < -0.2) {
+            setLookDirection('left');
+            lookDirTimerRef.current = 0.35;
+          } else if (pad.lookX > 0.2) {
+            setLookDirection('right');
+            lookDirTimerRef.current = 0.35;
+          }
+        }
+
+        if (Math.abs(pad.lookY) > 0.01) {
+          const lookSensY = (settings.gamepadSensitivity || 2.2) * 220;
+          engine.player.pitch = Math.max(-120, Math.min(120, engine.player.pitch + pad.lookY * lookSensY * dt));
+          mouseInertiaYRef.current += pad.lookY * 10 * dt;
+        }
+      }
+
+      // Input vectors (Combining keyboard & controller)
       const kb = settings.keyBindings;
-      const moveForward = ((keysPressed.current['KeyW'] || (kb && keysPressed.current[kb.moveForward]) || (!isPointerLocked && keysPressed.current['ArrowUp'])) ? 1 : 0) -
-                          ((keysPressed.current['KeyS'] || (kb && keysPressed.current[kb.moveBackward]) || (!isPointerLocked && keysPressed.current['ArrowDown'])) ? 1 : 0);
-      const moveRight = ((keysPressed.current['KeyD'] || (kb && keysPressed.current[kb.strafeRight])) ? 1 : 0) -
-                        ((keysPressed.current['KeyA'] || (kb && keysPressed.current[kb.strafeLeft])) ? 1 : 0);
+      let moveForward = ((keysPressed.current['KeyW'] || (kb && keysPressed.current[kb.moveForward]) || (!isPointerLocked && keysPressed.current['ArrowUp'])) ? 1 : 0) -
+                        ((keysPressed.current['KeyS'] || (kb && keysPressed.current[kb.moveBackward]) || (!isPointerLocked && keysPressed.current['ArrowDown'])) ? 1 : 0);
+      let moveRight = ((keysPressed.current['KeyD'] || (kb && keysPressed.current[kb.strafeRight])) ? 1 : 0) -
+                      ((keysPressed.current['KeyA'] || (kb && keysPressed.current[kb.strafeLeft])) ? 1 : 0);
+
+      if (pad.connected) {
+        if (Math.abs(pad.moveY) > 0.04) moveForward = pad.moveY;
+        if (Math.abs(pad.moveX) > 0.04) moveRight = pad.moveX;
+      }
 
       // Keyboard turning if mouse not locked (KeyE is strictly interact, not turn!)
       if (keysPressed.current['KeyQ'] || (!isPointerLocked && keysPressed.current['ArrowLeft'])) engine.player.angle -= 2.6 * dt;
       if (!isPointerLocked && keysPressed.current['ArrowRight']) engine.player.angle += 2.6 * dt;
 
       // Continuous automatic firing (Chaingun & Plasma Rifle)
-      if (keysPressed.current['MouseLeft']) {
+      if (keysPressed.current['MouseLeft'] || (pad.connected && pad.fire)) {
         const w = engine.player.weapons[engine.player.currentWeapon];
         if (w && w.isAutomatic) {
           engine.fireWeapon();
@@ -459,6 +588,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             projectiles: engine.projectiles,
             pickups: engine.mapData.pickups,
             chests: engine.mapData.chests,
+            secrets: engine.mapData.secrets,
+            airlockDoors: engine.mapData.airlockDoors,
+            airlockAnimProgress: engine.airlockAnimProgress,
             particles: engine.particles,
             flashLight,
             flashLightColor,
@@ -466,6 +598,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             time: engine.gameTime,
             exitPos: engine.mapData.exitPos,
             exitUnlocked: engine.mapData.exitUnlocked,
+            fov: settings.fov || 1.15,
           });
 
           // 2. Render Weapon Viewmodel at Bottom Center
@@ -1330,11 +1463,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         <canvas
           ref={canvasRef}
           id="raycaster-canvas"
-          width={960}
-          height={540}
+          width={Math.round(960 * (settings.renderResolution || 1))}
+          height={Math.round(540 * (settings.renderResolution || 1))}
           className={`w-full h-full object-cover ${engine.player.screenShake > 4 ? 'screen-shake' : ''}`}
           style={{
             transformOrigin: 'center center',
+            imageRendering: (settings.renderResolution || 1) < 1 ? 'pixelated' : 'auto',
           }}
         />
 
@@ -1390,6 +1524,92 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           </div>
         )}
 
+        {/* Glory Kill Screen-Splatter & Dripping Gore Overlay */}
+        {engine.glorySplatters.length > 0 && (
+          <svg
+            className="absolute inset-0 w-full h-full pointer-events-none z-15 overflow-hidden"
+            viewBox="0 0 1000 600"
+            preserveAspectRatio="none"
+          >
+            <defs>
+              <filter id="gore-blur" x="-20%" y="-20%" width="140%" height="140%">
+                <feGaussianBlur stdDeviation="0.6" result="blur" />
+                <feComposite in="SourceGraphic" in2="blur" operator="over" />
+              </filter>
+            </defs>
+            {engine.glorySplatters.map((drop) => {
+              const cx = drop.x * 1000;
+              const cy = drop.y * 600;
+              const r = drop.size * 1.1;
+              const dripLen = drop.length * (drop.dripProgress || 0);
+              const dripY = cy + dripLen;
+              const dripRadius = Math.max(2, r * 0.45 * (1 - drop.dripProgress * 0.3));
+
+              return (
+                <g key={drop.id} opacity={Math.max(0, Math.min(1, drop.opacity))} filter="url(#gore-blur)">
+                  {/* Drip trail tendril running downwards */}
+                  {dripLen > 3 && (
+                    <path
+                      d={`M ${cx - r * 0.35} ${cy} Q ${cx - dripRadius * 0.5} ${cy + dripLen * 0.6} ${cx - dripRadius} ${dripY} A ${dripRadius} ${dripRadius} 0 0 0 ${cx + dripRadius} ${dripY} Q ${cx + dripRadius * 0.5} ${cy + dripLen * 0.6} ${cx + r * 0.35} ${cy} Z`}
+                      fill={drop.color}
+                    />
+                  )}
+
+                  {/* Satellite droplets */}
+                  {drop.satellites.map((sat, idx) => (
+                    <circle
+                      key={idx}
+                      cx={cx + sat.dx}
+                      cy={cy + sat.dy}
+                      r={sat.r}
+                      fill={drop.color}
+                    />
+                  ))}
+
+                  {/* Main impact globule */}
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={r}
+                    fill={drop.color}
+                  />
+
+                  {/* Inner viscera core */}
+                  <circle
+                    cx={cx}
+                    cy={cy}
+                    r={r * 0.65}
+                    fill={drop.color}
+                    opacity="0.85"
+                  />
+
+                  {/* Wet specular light reflection arc */}
+                  <ellipse
+                    cx={cx - r * 0.3}
+                    cy={cy - r * 0.3}
+                    rx={r * 0.28}
+                    ry={r * 0.16}
+                    transform={`rotate(-25 ${cx - r * 0.3} ${cy - r * 0.3})`}
+                    fill={drop.highlightColor}
+                    opacity="0.75"
+                  />
+
+                  {/* Dripping tip specular highlight */}
+                  {dripLen > 8 && (
+                    <circle
+                      cx={cx - dripRadius * 0.25}
+                      cy={dripY - dripRadius * 0.25}
+                      r={Math.max(1, dripRadius * 0.35)}
+                      fill={drop.highlightColor}
+                      opacity="0.65"
+                    />
+                  )}
+                </g>
+              );
+            })}
+          </svg>
+        )}
+
         {/* Top Status Pill: Compact, sleek status bar (Lockdown > Wave > Safe Zone) */}
         {engine.isLockdown ? (
           <div id="lockdown-banner" className="absolute top-3 inset-x-0 mx-auto max-w-sm px-3.5 py-1 bg-red-950/90 border border-red-500 rounded-full shadow-lg flex items-center justify-center gap-2 animate-pulse pointer-events-none z-20">
@@ -1407,10 +1627,16 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             </span>
             <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
           </div>
-        ) : engine.inNeutralZone ? (
+        ) : engine.inNeutralZone || engine.airlockState === 'closed' || engine.airlockState === 'decompressing' ? (
           <div id="neutral-zone-banner" className="absolute top-3 inset-x-0 mx-auto max-w-xs px-3.5 py-1 bg-cyan-950/90 border border-cyan-500/70 rounded-full shadow-lg flex items-center justify-center gap-2 pointer-events-none animate-pulse z-20">
             <span className="text-[10px] font-pixel font-bold text-cyan-300 tracking-wider truncate">
-              🛡️ SAFE ZONE: AIRLOCK SECURE
+              {engine.airlockState === 'closed'
+                ? '🛡️ SAFE ROOM: STAGING PHASE'
+                : engine.airlockState === 'decompressing'
+                ? `⚠️ AIRLOCK DECOMPRESSING: ${engine.airlockTimer.toFixed(1)}s`
+                : engine.airlockSealed
+                ? '🛑 QUARANTINE: PERMANENTLY SEALED'
+                : '🛡️ SAFE ROOM: AIRLOCK OPEN'}
             </span>
           </div>
         ) : null}
@@ -1447,11 +1673,36 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           </div>
         )}
 
-        {/* Secret Interaction Prompt */}
-        {engine.mapData.secrets.some(s => !s.revealed && Math.hypot((s.triggerX + 0.5) - engine.player.x, (s.triggerY + 0.5) - engine.player.y) < 1.85) && (
-          <div id="secret-prompt" className="absolute bottom-24 inset-x-0 mx-auto max-w-xs px-3 py-1 bg-black/90 border border-amber-400 rounded-full text-center pointer-events-none animate-pulse z-20 shadow-[0_0_12px_rgba(250,204,21,0.4)]">
-            <span className="text-[11px] font-pixel text-amber-300 font-bold">
-              ⭐ PRESS [E] TO SEARCH HIDDEN SEAM
+        {/* Safe Staging Zone Airlock Console / Button Interaction Prompt */}
+        {engine.airlockState === 'closed' && (
+          <div id="airlock-prompt" className="absolute bottom-24 inset-x-0 mx-auto max-w-sm px-4 py-1.5 bg-emerald-950/95 border-2 border-emerald-400 rounded-full text-center pointer-events-none animate-pulse z-20 shadow-[0_0_20px_rgba(16,185,129,0.7)]">
+            <span className="text-[11px] sm:text-xs font-pixel text-emerald-300 font-bold tracking-wide">
+              🛡️ AIRLOCK CONSOLE // PRESS [E] TO DECOMPRESS & START LEVEL
+            </span>
+          </div>
+        )}
+
+        {engine.airlockState === 'decompressing' && (
+          <div id="airlock-decompressing-prompt" className="absolute bottom-24 inset-x-0 mx-auto max-w-sm px-4 py-1.5 bg-amber-950/95 border-2 border-amber-400 rounded-full text-center pointer-events-none animate-pulse z-20 shadow-[0_0_20px_rgba(245,158,11,0.7)]">
+            <span className="text-[11px] sm:text-xs font-pixel text-amber-300 font-bold tracking-wide">
+              ⚠️ DECOMPRESSING AIRLOCK CHAMBER... [{engine.airlockTimer.toFixed(1)}s]
+            </span>
+          </div>
+        )}
+
+        {engine.airlockState === 'open' && !engine.airlockSealed && (
+          <div id="airlock-open-prompt" className="absolute bottom-24 inset-x-0 mx-auto max-w-sm px-4 py-1.5 bg-cyan-950/95 border border-cyan-400 rounded-full text-center pointer-events-none animate-pulse z-20 shadow-[0_0_15px_rgba(6,182,212,0.5)]">
+            <span className="text-[11px] sm:text-xs font-pixel text-cyan-300 font-bold tracking-wide">
+              🚪 BLAST DOORS OPEN // PROCEED INTO COMBAT SECTOR
+            </span>
+          </div>
+        )}
+
+        {/* Chrono-Haste Relic Temporal Overdrive Active Banner */}
+        {Boolean(engine.player.infiniteDashTimer && engine.player.infiniteDashTimer > 0) && (
+          <div id="chrono-haste-badge" className="absolute top-16 inset-x-0 mx-auto max-w-xs px-3.5 py-1 bg-cyan-950/90 border border-cyan-400 rounded-full text-center pointer-events-none animate-pulse z-30 shadow-[0_0_18px_rgba(56,189,248,0.6)]">
+            <span className="text-[11px] font-pixel text-cyan-300 font-bold tracking-wide">
+              ⚡ CHRONO-HASTE: {engine.player.infiniteDashTimer?.toFixed(1)}s (ZERO CD DASH)
             </span>
           </div>
         )}
@@ -1503,8 +1754,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           />
         )}
 
+        {/* Retro Sector Debriefing Telemetry Modal */}
+        {engine.levelTransition.active && engine.levelTransition.isDebriefWaiting && (
+          <SectorDebriefModal
+            transition={engine.levelTransition}
+            onProceed={() => {
+              engine.confirmLevelTransition();
+            }}
+          />
+        )}
+
         {/* Level Transition Dimensional Warp Overlay */}
-        {engine.levelTransition.active && (
+        {engine.levelTransition.active && !engine.levelTransition.isDebriefWaiting && (
           <div id="level-transition-overlay" className="absolute inset-0 z-40 bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center pointer-events-none animate-fade-in">
             <div className="max-w-md w-full p-6 bg-red-950/80 border-2 border-amber-500 rounded-lg shadow-[0_0_40px_rgba(245,158,11,0.5)] flex flex-col items-center space-y-4">
               <div className="text-[10px] font-mono-tech uppercase tracking-widest text-emerald-400 font-bold animate-pulse">
@@ -1550,13 +1811,28 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           ))}
         </div>
 
-        {/* Pointer Lock Prompt (When not locked) */}
-        {!isPointerLocked && !engine.isGameOver && !engine.isVictory && !engine.isPaused && !engine.isMutating && (
+        {/* Gamepad Connection Notification Toast */}
+        {gamepadNotification && (
+          <div id="gamepad-notification-toast" className="absolute top-16 inset-x-0 mx-auto max-w-sm px-4 py-2 bg-neutral-950/95 border-2 border-emerald-500/80 rounded-lg shadow-[0_0_25px_rgba(16,185,129,0.4)] flex items-center gap-3 z-50 animate-bounce">
+            <Gamepad2 className="w-5 h-5 text-emerald-400 shrink-0" />
+            <div className="text-left truncate">
+              <div className="font-pixel text-[10px] text-emerald-300 font-bold uppercase">
+                {gamepadNotification.type === 'connected' ? 'CONTROLLER CONNECTED' : 'CONTROLLER DISCONNECTED'}
+              </div>
+              <div className="text-xs text-gray-200 font-mono-tech truncate">
+                {gamepadNotification.name}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Pointer Lock Prompt (When not locked and not actively using controller) */}
+        {!isPointerLocked && !isGamepadConnected && !engine.isGameOver && !engine.isVictory && !engine.isPaused && !engine.isMutating && (
           <div className="absolute inset-0 z-30 bg-black/75 backdrop-blur-xs flex flex-col items-center justify-center p-4 text-center">
             <div className="p-4 bg-red-950/80 border-2 border-red-600 rounded-lg shadow-2xl max-w-sm">
               <h3 className="text-lg font-pixel text-red-500 font-bold mb-2">KILL-O-METER</h3>
               <p className="text-xs font-mono-tech text-gray-300 mb-4">
-                Click anywhere inside the arena to lock mouse cursor and engage combat.
+                Click anywhere inside the arena to lock mouse cursor, or connect a Gamepad to play immediately.
               </p>
               <button
                 onClick={(e) => {
@@ -1579,6 +1855,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           combo={engine.combo}
           killOMeter={engine.killOMeter}
           levelKills={engine.levelKills}
+          requiredKills={engine.requiredKills}
           totalLevelEnemies={engine.totalLevelEnemies}
           isLockdown={engine.isLockdown}
           boss={engine.boss}

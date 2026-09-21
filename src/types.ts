@@ -24,7 +24,7 @@ export interface Weapon {
 
 export type EnemyType = 'grunt' | 'imp' | 'baron' | 'lost_soul' | 'boss' | 'scuttler' | 'plasma_gunner' | 'vile_spitter';
 
-export type EnemyState = 'idle' | 'patrol' | 'chase' | 'search' | 'attack' | 'pain' | 'staggered' | 'dying' | 'dead' | 'gibbed';
+export type EnemyState = 'idle' | 'patrol' | 'chase' | 'search' | 'guard' | 'attack' | 'pain' | 'staggered' | 'dying' | 'dead' | 'gibbed' | 'alert';
 
 export interface Enemy {
   id: number;
@@ -49,7 +49,14 @@ export interface Enemy {
   targetY?: number;
   lastSeenPlayerPos?: { x: number; y: number };
   spawnOrigin?: { x: number; y: number };
+  homePost?: { x: number; y: number };
+  sectorName?: string;
+  territoryRadius?: number;
+  guardAngle?: number;
+  guardTimer?: number;
   patrolTarget?: { x: number; y: number };
+  patrolWaypoints?: { x: number; y: number }[];
+  waypointIndex?: number;
   patrolTimer?: number;
   searchTimer?: number;
   alertTimer?: number;
@@ -65,6 +72,9 @@ export interface Enemy {
   staggerTimer?: number;
   stuckTimer?: number;
   unstuckNudgeAngle?: number;
+  stageBossId?: number;
+  bossName?: string;
+  bossSubtitle?: string;
 }
 
 export interface Projectile {
@@ -84,6 +94,21 @@ export interface Projectile {
   splashRadius?: number;
 }
 
+export type GibType =
+  | 'skull'
+  | 'meat'
+  | 'rib'
+  | 'eyeball'
+  | 'blood_drop'
+  | 'metal_shard'
+  | 'severed_arm'
+  | 'severed_leg'
+  | 'heart'
+  | 'jaw'
+  | 'intestine'
+  | 'demon_horn'
+  | 'brain_lobe';
+
 export interface GibParticle {
   id: number;
   x: number;
@@ -94,13 +119,34 @@ export interface GibParticle {
   vz: number;
   rot: number;
   vRot: number;
-  gibType: 'skull' | 'meat' | 'rib' | 'eyeball' | 'blood_drop' | 'metal_shard';
+  gibType: GibType;
   size: number;
   color: string;
   bounces: number;
   life: number;
   maxLife: number;
   settled: boolean;
+}
+
+export interface SplatterSatellite {
+  dx: number;
+  dy: number;
+  r: number;
+}
+
+export interface GlorySplatterDrop {
+  id: number;
+  x: number; // 0 to 1 percentage of screen width
+  y: number; // 0 to 1 percentage of screen height
+  size: number; // base splatter radius
+  length: number; // drip trail length in px
+  dripProgress: number; // 0 to 1
+  opacity: number;
+  color: string;
+  highlightColor: string;
+  satellites: SplatterSatellite[];
+  dripSpeed: number;
+  decaySpeed: number;
 }
 
 export interface FloorDecal {
@@ -174,7 +220,8 @@ export type PickupType =
   | 'weapon_shotgun' 
   | 'weapon_chaingun' 
   | 'weapon_plasma'
-  | 'berserk_sphere';
+  | 'berserk_sphere'
+  | 'infinite_dash_relic';
 
 export interface PickupItem {
   id: number;
@@ -195,7 +242,8 @@ export type ChestLootType =
   | 'ammo_shells' 
   | 'ammo_cells' 
   | 'ammo_belts'
-  | 'berserk_sphere';
+  | 'berserk_sphere'
+  | 'infinite_dash_relic';
 
 export interface LootChest {
   id: number;
@@ -264,6 +312,7 @@ export interface Player {
   };
   invulnerableTimer: number;
   berserkTimer: number; // double damage + speed
+  infiniteDashTimer?: number; // chrono-haste: 0 cooldown dash
   screenShake: number;
   damageFlash: number; // 0 to 1 red vignette
   healFlash: number; // green vignette
@@ -304,6 +353,7 @@ export interface BossState {
   spawned: boolean;
   enemyId?: number;
   name: string;
+  subtitle?: string;
   phase: number; // 1, 2, 3
   shieldActive: boolean;
   shieldTimer: number;
@@ -344,6 +394,8 @@ export interface LevelTransition {
   kills?: number;
   secretsFound?: number;
   totalSecrets?: number;
+  isDebriefWaiting?: boolean; // Wait for player click or Spacebar to deploy
+  timeElapsed?: number;
 }
 
 export interface SecretArea {
@@ -355,11 +407,31 @@ export interface SecretArea {
   doorY: number;
   revealed: boolean;
   rewardDescription: string;
+  animOffset?: number; // 0 (closed) to 1 (fully receded into floor)
+  animating?: boolean;
+  animTimer?: number;
+}
+
+export interface AirlockDoor {
+  x: number;
+  y: number;
+  animOffset?: number; // 0 (closed) to 1 (fully receded / opened)
+  sealed?: boolean; // true once permanently closed behind player
+}
+
+export interface AirlockConsole {
+  x: number;
+  y: number;
+  triggered?: boolean;
 }
 
 export interface GameSettings {
   difficulty: Difficulty;
   mouseSensitivity: number;
+  gamepadSensitivity: number; // 1.0 to 5.0, default 2.2
+  gamepadDeadzone: number; // 0.05 to 0.35, default 0.15
+  gamepadInvertY: boolean; // default false
+  gamepadVibration: boolean; // default true
   soundVolume: number;
   musicVolume: number;
   renderResolution: number; // 1 = full, 0.75 = medium, 0.5 = retro low-res

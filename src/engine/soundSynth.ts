@@ -26,6 +26,12 @@ class SoundSynthEngine {
   private sharedCrashBuffer: AudioBuffer | null = null;
   private lastRicochetTime = 0;
 
+  // Safe Zone Audio Muffle Filter & Secret Ambient Proximity Hum
+  private musicFilter: BiquadFilterNode | null = null;
+  private secretHumOsc: OscillatorNode | null = null;
+  private secretHumGain: GainNode | null = null;
+  private isSafeZoneMuffled = false;
+
   public init() {
     if (this.ctx) return;
     try {
@@ -54,9 +60,37 @@ class SoundSynthEngine {
       this.sfxGain.gain.value = 0.85;
       this.sfxGain.connect(this.compressor);
 
+      // Music dynamic output bus with safe-zone low-pass muffling filter
       this.musicGain = this.ctx.createGain();
       this.musicGain.gain.value = 0.42;
-      this.musicGain.connect(this.compressor);
+
+      this.musicFilter = this.ctx.createBiquadFilter();
+      this.musicFilter.type = 'lowpass';
+      this.musicFilter.frequency.setValueAtTime(20000, this.ctx.currentTime);
+      this.musicFilter.Q.setValueAtTime(1.2, this.ctx.currentTime);
+
+      this.musicGain.connect(this.musicFilter);
+      this.musicFilter.connect(this.compressor);
+
+      // Secret Proximity Ambient Resonance Hum (Subtle subterranean 65-110Hz frequency)
+      try {
+        this.secretHumOsc = this.ctx.createOscillator();
+        this.secretHumGain = this.ctx.createGain();
+        this.secretHumOsc.type = 'triangle';
+        this.secretHumOsc.frequency.setValueAtTime(74, this.ctx.currentTime);
+        this.secretHumGain.gain.setValueAtTime(0.0001, this.ctx.currentTime);
+
+        const humFilter = this.ctx.createBiquadFilter();
+        humFilter.type = 'lowpass';
+        humFilter.frequency.setValueAtTime(160, this.ctx.currentTime);
+
+        this.secretHumOsc.connect(humFilter);
+        humFilter.connect(this.secretHumGain);
+        this.secretHumGain.connect(this.sfxGain);
+        this.safeStart(this.secretHumOsc, this.ctx.currentTime);
+      } catch {
+        // Audio node creation fallback
+      }
 
       // Pre-allocate audio noise buffers to eliminate garbage collection stutters
       const sampleRate = this.ctx.sampleRate;
@@ -86,8 +120,8 @@ class SoundSynthEngine {
         const env = Math.exp(-i / (sampleRate * 0.35));
         cData[i] = (Math.random() * 2 - 1) * env;
       }
-    } catch (e) {
-      console.warn('Web Audio initialization failed:', e);
+    } catch {
+      // Audio context initialization fallback
     }
   }
 
@@ -158,6 +192,84 @@ class SoundSynthEngine {
       osc.connect(gain);
       gain.connect(this.sfxGain);
       this.safeStart(osc, this.ctx.currentTime, this.ctx.currentTime + 0.06);
+    } catch {
+      // Ignored
+    }
+  }
+
+  public playCyberBoot() {
+    if (!this.ctx || !this.sfxGain) return;
+    try {
+      const now = this.ctx.currentTime;
+      // Retro FM synth power-on sweep
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(60, now);
+      osc.frequency.exponentialRampToValueAtTime(880, now + 0.35);
+      osc.frequency.exponentialRampToValueAtTime(440, now + 0.55);
+
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.setValueAtTime(400, now);
+      f.frequency.exponentialRampToValueAtTime(3200, now + 0.4);
+
+      gain.gain.setValueAtTime(0.01, now);
+      gain.gain.linearRampToValueAtTime(0.4, now + 0.1);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+
+      osc.connect(f);
+      f.connect(gain);
+      gain.connect(this.sfxGain);
+      this.safeStart(osc, now, now + 0.65);
+    } catch {
+      // Ignored
+    }
+  }
+
+  public playGlitchStatic() {
+    if (!this.ctx || !this.sfxGain) return;
+    try {
+      const now = this.ctx.currentTime;
+      const noise = this.createNoiseSource();
+      if (noise) {
+        const filter = this.ctx.createBiquadFilter();
+        filter.type = 'bandpass';
+        filter.frequency.setValueAtTime(1800, now);
+        filter.frequency.exponentialRampToValueAtTime(400, now + 0.12);
+        filter.Q.setValueAtTime(6.0, now);
+
+        const gain = this.ctx.createGain();
+        gain.gain.setValueAtTime(0.35, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+
+        noise.connect(filter);
+        filter.connect(gain);
+        gain.connect(this.sfxGain);
+        this.safeStart(noise, now, now + 0.13);
+      }
+    } catch {
+      // Ignored
+    }
+  }
+
+  public playBreachSiren() {
+    if (!this.ctx || !this.sfxGain) return;
+    try {
+      const now = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(880, now);
+      osc.frequency.linearRampToValueAtTime(440, now + 0.25);
+      osc.frequency.linearRampToValueAtTime(880, now + 0.5);
+
+      gain.gain.setValueAtTime(0.35, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.52);
+
+      osc.connect(gain);
+      gain.connect(this.sfxGain);
+      this.safeStart(osc, now, now + 0.55);
     } catch {
       // Ignored
     }
@@ -1509,25 +1621,222 @@ class SoundSynthEngine {
     if (!this.ctx || !this.sfxGain) return;
     const now = this.ctx.currentTime;
 
+    // Heavy hydraulic stone grinding slide
     const noise = this.createNoiseSource();
     if (noise) {
       const filter = this.ctx.createBiquadFilter();
       filter.type = 'bandpass';
-      filter.frequency.setValueAtTime(260, now);
-      filter.frequency.linearRampToValueAtTime(460, now + 0.25);
-      filter.frequency.linearRampToValueAtTime(190, now + 0.5);
-      filter.Q.setValueAtTime(3.5, now);
+      filter.frequency.setValueAtTime(220, now);
+      filter.frequency.linearRampToValueAtTime(380, now + 0.4);
+      filter.frequency.linearRampToValueAtTime(140, now + 0.85);
+      filter.Q.setValueAtTime(4.0, now);
 
       const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.75, now);
-      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.5);
+      gain.gain.setValueAtTime(0.85, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.85);
 
       noise.connect(filter);
       filter.connect(gain);
       gain.connect(this.sfxGain);
 
-      this.safeStart(noise, now, now + 0.52);
+      this.safeStart(noise, now, now + 0.88);
     }
+
+    // Sub-bass stone rumble
+    const subOsc = this.ctx.createOscillator();
+    const subGain = this.ctx.createGain();
+    subOsc.type = 'sawtooth';
+    subOsc.frequency.setValueAtTime(65, now);
+    subOsc.frequency.exponentialRampToValueAtTime(32, now + 0.85);
+    subGain.gain.setValueAtTime(0.65, now);
+    subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.85);
+
+    subOsc.connect(subGain);
+    subGain.connect(this.sfxGain);
+    this.safeStart(subOsc, now, now + 0.88);
+  }
+
+  /**
+   * Safe Zone Muffled Audio Shift:
+   * Smoothly low-passes the synth background music down to ~450 Hz with resonance
+   * when player is inside the safe bunker / staging area, and snaps open when entering combat.
+   */
+  public setSafeZoneAudio(inSafeZone: boolean) {
+    if (!this.ctx || !this.musicFilter) return;
+    if (this.isSafeZoneMuffled === inSafeZone) return;
+    this.isSafeZoneMuffled = inSafeZone;
+    const now = this.ctx.currentTime;
+    this.musicFilter.frequency.cancelScheduledValues(now);
+
+    if (inSafeZone) {
+      this.musicFilter.frequency.setTargetAtTime(450, now, 0.4);
+    } else {
+      this.musicFilter.frequency.setTargetAtTime(20000, now, 0.25);
+    }
+  }
+
+  /**
+   * Secret Area Proximity Resonance Hum:
+   * Updates gain on subterranean 74Hz oscillator when player is near an unrevealed secret wall.
+   */
+  public updateSecretHum(proximity: number) {
+    if (!this.ctx || !this.secretHumGain) return;
+    const target = Math.max(0, Math.min(1, proximity)) * 0.22;
+    const now = this.ctx.currentTime;
+    this.secretHumGain.gain.setTargetAtTime(target, now, 0.12);
+  }
+
+  /**
+   * Relic / Artifact Pickup Chime (Chrono-Haste / Infinite Dash Relic)
+   */
+  public playRelicPickup() {
+    if (!this.ctx || !this.sfxGain) return;
+    const now = this.ctx.currentTime;
+
+    const chords = [440, 554.37, 659.25, 880, 1108.73, 1318.51];
+    chords.forEach((freq, idx) => {
+      if (!this.ctx || !this.sfxGain) return;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(freq, now + idx * 0.05);
+
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.setValueAtTime(freq * 1.5, now + idx * 0.05);
+      f.Q.setValueAtTime(5, now + idx * 0.05);
+
+      gain.gain.setValueAtTime(0.001, now + idx * 0.05);
+      gain.gain.linearRampToValueAtTime(0.55, now + idx * 0.05 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.05 + 0.6);
+
+      osc.connect(f);
+      f.connect(gain);
+      gain.connect(this.sfxGain);
+      this.safeStart(osc, now + idx * 0.05, now + idx * 0.05 + 0.65);
+    });
+  }
+
+  /**
+   * Airlock Button / Console Switch Activation Click
+   */
+  public playAirlockButtonPress() {
+    if (!this.ctx || !this.sfxGain) return;
+    const now = this.ctx.currentTime;
+
+    // Heavy mechanical switch click
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(800, now);
+    osc.frequency.exponentialRampToValueAtTime(140, now + 0.06);
+    gain.gain.setValueAtTime(0.7, now);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.06);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    this.safeStart(osc, now, now + 0.065);
+
+    // Electronic authorization chime
+    const osc2 = this.ctx.createOscillator();
+    const gain2 = this.ctx.createGain();
+    osc2.type = 'sine';
+    osc2.frequency.setValueAtTime(987.77, now + 0.04);
+    osc2.frequency.setValueAtTime(1318.51, now + 0.12);
+    gain2.gain.setValueAtTime(0.01, now + 0.04);
+    gain2.gain.linearRampToValueAtTime(0.55, now + 0.06);
+    gain2.gain.exponentialRampToValueAtTime(0.01, now + 0.35);
+    osc2.connect(gain2);
+    gain2.connect(this.sfxGain);
+    this.safeStart(osc2, now + 0.04, now + 0.36);
+  }
+
+  /**
+   * Airlock / Gate Switch Cycling Decompression Sound
+   */
+  public playAirlockCycle() {
+    if (!this.ctx || !this.sfxGain) return;
+    const now = this.ctx.currentTime;
+
+    // Steam decompression hiss
+    const noise = this.createNoiseSource();
+    if (noise) {
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'bandpass';
+      f.frequency.setValueAtTime(1400, now);
+      f.frequency.exponentialRampToValueAtTime(450, now + 1.2);
+      f.Q.setValueAtTime(2.0, now);
+
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(0.8, now);
+      g.gain.exponentialRampToValueAtTime(0.01, now + 1.2);
+
+      noise.connect(f);
+      f.connect(g);
+      g.connect(this.sfxGain);
+      this.safeStart(noise, now, now + 1.25);
+    }
+
+    // Heavy mechanical latch thud
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(95, now);
+    osc.frequency.exponentialRampToValueAtTime(30, now + 0.4);
+    g.gain.setValueAtTime(0.9, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + 0.4);
+
+    osc.connect(g);
+    g.connect(this.sfxGain);
+    this.safeStart(osc, now, now + 0.45);
+  }
+
+  /**
+   * Airlock Permanent Lockdown Slam & Magnetic Seal Sound
+   */
+  public playAirlockPermanentLockdown() {
+    if (!this.ctx || !this.sfxGain) return;
+    const now = this.ctx.currentTime;
+
+    // Massive pneumatic slam & sub-bass impact
+    const sub = this.ctx.createOscillator();
+    const subGain = this.ctx.createGain();
+    sub.type = 'sawtooth';
+    sub.frequency.setValueAtTime(160, now);
+    sub.frequency.exponentialRampToValueAtTime(28, now + 0.55);
+    subGain.gain.setValueAtTime(1.3, now);
+    subGain.gain.exponentialRampToValueAtTime(0.001, now + 0.55);
+    sub.connect(subGain);
+    subGain.connect(this.sfxGain);
+    this.safeStart(sub, now, now + 0.58);
+
+    // Industrial metal impact clamp
+    const noise = this.createNoiseSource();
+    if (noise) {
+      const f = this.ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.setValueAtTime(950, now);
+      f.frequency.exponentialRampToValueAtTime(80, now + 0.4);
+      const g = this.ctx.createGain();
+      g.gain.setValueAtTime(1.1, now);
+      g.gain.exponentialRampToValueAtTime(0.01, now + 0.42);
+      noise.connect(f);
+      f.connect(g);
+      g.connect(this.sfxGain);
+      this.safeStart(noise, now, now + 0.45);
+    }
+
+    // High frequency pneumatic latch click
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = 'square';
+    osc.frequency.setValueAtTime(240, now + 0.08);
+    osc.frequency.setValueAtTime(120, now + 0.16);
+    gain.gain.setValueAtTime(0.01, now);
+    gain.gain.setValueAtTime(0.6, now + 0.08);
+    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+    osc.connect(gain);
+    gain.connect(this.sfxGain);
+    this.safeStart(osc, now + 0.08, now + 0.32);
   }
 
   public playWaveIncoming() {
@@ -1640,6 +1949,10 @@ class SoundSynthEngine {
 
   private scheduler() {
     if (!this.ctx) return;
+    // Catch-up protection against background tab throttling or audio context drift
+    if (this.nextNoteTime < this.ctx.currentTime) {
+      this.nextNoteTime = this.ctx.currentTime + 0.02;
+    }
     const scheduleAheadTime = 0.12; // Queue nodes 120ms into future
     while (this.nextNoteTime < this.ctx.currentTime + scheduleAheadTime) {
       this.scheduleMusicStep(this.musicStep, this.nextNoteTime);

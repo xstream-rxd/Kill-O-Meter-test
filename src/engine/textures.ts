@@ -30,6 +30,7 @@ export class TextureManager {
   public weaponCanvases: Record<string, HTMLCanvasElement[]> = {};
   public enemyCanvases: Record<string, HTMLCanvasElement[]> = {};
   public ultraBossCanvases: HTMLCanvasElement[] = [];
+  public stageBossCanvases: Record<number, HTMLCanvasElement[]> = {};
   public portalCanvases: Record<number, HTMLCanvasElement[]> = {};
   public teleportCanvas: HTMLCanvasElement | null = null;
   public chestCanvas: HTMLCanvasElement | null = null;
@@ -353,40 +354,62 @@ export class TextureManager {
         ctx.fillRect(size - 10, size - 10, 4, 2); ctx.fillRect(size - 10, size - 8, 2, 4);
       },
 
-      // 6: Concealed Secret Wall / Cracked Seam (Subtly cracked panel with golden micro-glyph indicator for observant players)
+      // 6: Concealed Stealth Bulkhead / Secret Receding Wall (Stealthy, seamless blend with surrounding walls with subtle mechanical tells)
       (ctx) => {
-        // Base matches surrounding tech/stone wall but features a subtle misaligned hydraulic seam
-        ctx.fillStyle = '#1e2836';
+        // Base matches surrounding gunmetal & composite armor plates
+        ctx.fillStyle = '#1c2430';
         ctx.fillRect(0, 0, size, size);
 
-        // Bevelled panel
-        ctx.strokeStyle = '#0f172a';
+        // Subtle steel grain & micro-texture noise
+        ctx.fillStyle = '#263342';
+        for (let i = 0; i < 80; i++) {
+          const nx = (i * 19) % size;
+          const ny = (i * 31) % size;
+          ctx.fillRect(nx, ny, 2, 1);
+        }
+
+        // Heavy bevelled frame border matching adjacent walls
+        ctx.strokeStyle = '#0e141c';
         ctx.lineWidth = 2;
-        ctx.strokeRect(2, 2, size - 4, size - 4);
+        ctx.strokeRect(1, 1, size - 2, size - 2);
 
-        // Vertical sliding hydraulic split line
-        ctx.fillStyle = '#090d14';
-        ctx.fillRect(31, 0, 2, size);
-
-        // Structural stress fracture / crack across seam
-        ctx.strokeStyle = '#0f172a';
+        // Top/Left subtle highlight bevel
+        ctx.strokeStyle = '#3b4c60';
         ctx.lineWidth = 1;
         ctx.beginPath();
-        ctx.moveTo(14, 18); ctx.lineTo(32, 26); ctx.lineTo(24, 38); ctx.lineTo(32, 46); ctx.lineTo(50, 52);
+        ctx.moveTo(2, size - 3); ctx.lineTo(2, 2); ctx.lineTo(size - 3, 2);
         ctx.stroke();
 
-        // Golden secret trigger glyph / optical sensor (tells the player: Press [E] or shoot to open!)
-        ctx.fillStyle = '#ca8a04';
-        ctx.fillRect(28, 28, 8, 8);
-        ctx.fillStyle = '#facc15';
-        ctx.fillRect(30, 30, 4, 4);
-        ctx.fillStyle = '#fef08a';
-        ctx.fillRect(31, 31, 2, 2);
+        // Inner recessed panel (identical chamfer proportions to standard tech panels)
+        ctx.fillStyle = '#161e28';
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') ctx.roundRect(8, 8, size - 16, size - 16, 6); else ctx.rect(8, 8, size - 16, size - 16);
+        ctx.fill();
+        ctx.strokeStyle = '#253242';
+        ctx.stroke();
 
-        // Concealed hydraulic latch vents
-        ctx.fillStyle = '#0f172a';
-        ctx.fillRect(10, 52, 12, 3);
-        ctx.fillRect(42, 52, 12, 3);
+        // Very faint, hairline vertical hydraulic sliding seam (stealth tell 1)
+        ctx.fillStyle = '#0d131a';
+        ctx.fillRect(31, 8, 1, size - 16);
+
+        // Subtle floor track recess shadow at the bottom edge (stealth tell 2)
+        ctx.fillStyle = '#080c10';
+        ctx.fillRect(8, size - 11, size - 16, 2);
+
+        // Standard countersunk rivets at the 4 corners
+        [[12, 12], [size - 13, 12], [12, size - 13], [size - 13, size - 13]].forEach(([bx, by]) => {
+          ctx.fillStyle = '#090d14';
+          ctx.beginPath(); ctx.arc(bx + 1, by + 1, 2, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#64748b';
+          ctx.beginPath(); ctx.arc(bx, by, 1.2, 0, Math.PI * 2); ctx.fill();
+        });
+
+        // Faint weathered surface abrasion across the seam (stealth tell 3 - only visible upon close inspection)
+        ctx.strokeStyle = '#2d3b4e';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(22, 28); ctx.lineTo(32, 31); ctx.lineTo(39, 29);
+        ctx.stroke();
       },
 
       // 7: Dimensional Rift Portal Gateway (Swirling cobalt vortex, quantum event horizon, runic energy conduits)
@@ -901,9 +924,10 @@ export class TextureManager {
 
   // --- ENEMY SPRITES (MUTANTS & ZOMBIES) ---
   private generateEnemySprites() {
-    const { enemyCanvases, ultraBossCanvases } = generateAllEnemySprites(this.createCanvas.bind(this));
+    const { enemyCanvases, ultraBossCanvases, stageBossCanvases } = generateAllEnemySprites(this.createCanvas.bind(this));
     this.enemyCanvases = enemyCanvases;
     this.ultraBossCanvases = ultraBossCanvases;
+    this.stageBossCanvases = stageBossCanvases;
   }
 
   // --- SCI-FI ITEM / PICKUP & PORTAL SPRITES ---
@@ -1056,14 +1080,208 @@ export class TextureManager {
     this.gibCanvases['eyeball'] = this.createCanvas(size, size, (ctx) => {
       ctx.fillStyle = '#f8fafc';
       ctx.beginPath();
-      ctx.arc(16, 16, 10, 0, Math.PI * 2);
+      ctx.arc(16, 16, 9, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = '#dc2626'; // Iris
+      // Red bloody iris with dilated pupil
+      ctx.fillStyle = '#dc2626';
       ctx.beginPath();
       ctx.arc(16, 16, 5, 0, Math.PI * 2);
       ctx.fill();
-      ctx.fillStyle = '#000000'; // Pupil
-      ctx.fillRect(15, 15, 2, 2);
+      ctx.fillStyle = '#000000';
+      ctx.beginPath();
+      ctx.arc(16, 16, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+      // Severed optic nerve & blood trail
+      ctx.fillStyle = '#991b1b';
+      ctx.fillRect(6, 14, 6, 4);
+      ctx.fillRect(3, 16, 4, 3);
+      ctx.fillStyle = '#f87171';
+      ctx.fillRect(8, 15, 3, 2);
+    });
+
+    // Blood drop / Visceral Globule
+    this.gibCanvases['blood_drop'] = this.createCanvas(size, size, (ctx) => {
+      ctx.fillStyle = '#7f1d1d';
+      ctx.beginPath();
+      ctx.arc(16, 18, 10, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(10, 16);
+      ctx.lineTo(16, 4);
+      ctx.lineTo(22, 16);
+      ctx.closePath();
+      ctx.fill();
+      // Bright arterial core & specular highlight
+      ctx.fillStyle = '#b91c1c';
+      ctx.beginPath();
+      ctx.arc(16, 18, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fca5a5';
+      ctx.beginPath();
+      ctx.arc(14, 14, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    });
+
+    // Cybernetic Metal Shard
+    this.gibCanvases['metal_shard'] = this.createCanvas(size, size, (ctx) => {
+      ctx.fillStyle = '#334155'; // Armor slate
+      ctx.beginPath();
+      ctx.moveTo(6, 6);
+      ctx.lineTo(26, 10);
+      ctx.lineTo(22, 26);
+      ctx.lineTo(8, 22);
+      ctx.closePath();
+      ctx.fill();
+      // Metallic bevel
+      ctx.fillStyle = '#64748b';
+      ctx.fillRect(8, 8, 12, 4);
+      ctx.fillRect(10, 14, 8, 4);
+      // Energized cyan circuit fracture
+      ctx.fillStyle = '#38bdf8';
+      ctx.fillRect(12, 10, 2, 10);
+      ctx.fillRect(14, 14, 6, 2);
+      ctx.fillStyle = '#991b1b'; // Splattered blood on plating
+      ctx.fillRect(6, 16, 5, 5);
+    });
+
+    // Severed Demon / Grunt Arm
+    this.gibCanvases['severed_arm'] = this.createCanvas(size, size, (ctx) => {
+      // Forearm flesh
+      ctx.fillStyle = '#7f1d1d';
+      ctx.fillRect(8, 10, 14, 8);
+      ctx.fillStyle = '#991b1b';
+      ctx.fillRect(10, 11, 10, 6);
+      // Severed bloody elbow joint & bone stump
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(6, 12, 4, 4);
+      ctx.fillStyle = '#450a0a';
+      ctx.fillRect(6, 9, 3, 10);
+      // Clawed hand & talon fingers
+      ctx.fillStyle = '#1c1917';
+      ctx.fillRect(22, 10, 6, 8);
+      ctx.fillStyle = '#f8fafc'; // Claws
+      ctx.fillRect(27, 9, 3, 2);
+      ctx.fillRect(28, 12, 3, 2);
+      ctx.fillRect(27, 15, 3, 2);
+    });
+
+    // Severed Demon Leg / Clawed Foot
+    this.gibCanvases['severed_leg'] = this.createCanvas(size, size, (ctx) => {
+      // Shin flesh
+      ctx.fillStyle = '#7f1d1d';
+      ctx.fillRect(10, 6, 8, 16);
+      ctx.fillStyle = '#b91c1c';
+      ctx.fillRect(12, 8, 5, 12);
+      // Torn thigh bone stump
+      ctx.fillStyle = '#e2e8f0';
+      ctx.fillRect(12, 4, 4, 4);
+      ctx.fillStyle = '#450a0a';
+      ctx.fillRect(9, 3, 10, 3);
+      // Demonic hooved / clawed foot
+      ctx.fillStyle = '#18181b';
+      ctx.fillRect(10, 22, 14, 6);
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillRect(23, 24, 4, 3);
+    });
+
+    // Pulsing Demon Heart
+    this.gibCanvases['heart'] = this.createCanvas(size, size, (ctx) => {
+      // Heart muscular chambers
+      ctx.fillStyle = '#7f1d1d';
+      ctx.beginPath();
+      ctx.arc(12, 14, 7, 0, Math.PI * 2);
+      ctx.arc(20, 14, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(6, 16);
+      ctx.lineTo(16, 28);
+      ctx.lineTo(26, 16);
+      ctx.closePath();
+      ctx.fill();
+      // Aortic valves & severed tubes
+      ctx.fillStyle = '#450a0a';
+      ctx.fillRect(10, 4, 4, 6);
+      ctx.fillRect(17, 5, 4, 5);
+      // Arterial shine
+      ctx.fillStyle = '#ef4444';
+      ctx.fillRect(11, 13, 4, 4);
+      ctx.fillRect(17, 13, 4, 4);
+      ctx.fillStyle = '#fee2e2';
+      ctx.fillRect(12, 12, 2, 2);
+    });
+
+    // Snapping Demon Jaw with Fangs
+    this.gibCanvases['jaw'] = this.createCanvas(size, size, (ctx) => {
+      // Mandible bone
+      ctx.fillStyle = '#e2e8f0';
+      ctx.beginPath();
+      ctx.arc(16, 14, 10, 0, Math.PI);
+      ctx.fill();
+      ctx.fillStyle = '#7f1d1d';
+      ctx.fillRect(8, 12, 16, 5);
+      // Sharp predatory teeth / fangs
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillRect(8, 7, 3, 5);
+      ctx.fillRect(12, 8, 3, 4);
+      ctx.fillRect(17, 8, 3, 4);
+      ctx.fillRect(21, 7, 3, 5);
+      // Blood dripping
+      ctx.fillStyle = '#991b1b';
+      ctx.fillRect(11, 16, 3, 8);
+      ctx.fillRect(18, 16, 3, 6);
+    });
+
+    // Coiled Visceral Intestine
+    this.gibCanvases['intestine'] = this.createCanvas(size, size, (ctx) => {
+      ctx.fillStyle = '#991b1b';
+      ctx.fillRect(6, 8, 20, 6);
+      ctx.fillRect(8, 14, 18, 6);
+      ctx.fillRect(6, 20, 18, 6);
+      // Highlights & gore tissue
+      ctx.fillStyle = '#f87171';
+      ctx.fillRect(8, 9, 15, 3);
+      ctx.fillRect(10, 15, 13, 3);
+      ctx.fillRect(8, 21, 13, 3);
+      ctx.fillStyle = '#450a0a';
+      ctx.fillRect(4, 7, 4, 20);
+    });
+
+    // Demon Horn
+    this.gibCanvases['demon_horn'] = this.createCanvas(size, size, (ctx) => {
+      // Obsidian horn curved spike
+      ctx.fillStyle = '#1c1917';
+      ctx.beginPath();
+      ctx.moveTo(6, 26);
+      ctx.quadraticCurveTo(12, 12, 26, 6);
+      ctx.quadraticCurveTo(18, 22, 12, 28);
+      ctx.closePath();
+      ctx.fill();
+      // Molten orange vein fissure
+      ctx.fillStyle = '#f97316';
+      ctx.fillRect(12, 18, 4, 3);
+      ctx.fillRect(16, 14, 3, 3);
+      // Bloody fracture base
+      ctx.fillStyle = '#991b1b';
+      ctx.fillRect(6, 24, 7, 5);
+      ctx.fillStyle = '#f8fafc';
+      ctx.fillRect(7, 25, 3, 2);
+    });
+
+    // Cerebral Brain Lobe
+    this.gibCanvases['brain_lobe'] = this.createCanvas(size, size, (ctx) => {
+      ctx.fillStyle = '#be123c'; // Deep crimson cortex
+      ctx.beginPath();
+      ctx.arc(16, 16, 11, 0, Math.PI * 2);
+      ctx.fill();
+      // Cerebral sulci / fissures
+      ctx.fillStyle = '#fda4af';
+      ctx.fillRect(9, 10, 6, 3);
+      ctx.fillRect(17, 10, 6, 3);
+      ctx.fillRect(8, 15, 7, 3);
+      ctx.fillRect(17, 15, 7, 3);
+      ctx.fillRect(10, 20, 12, 3);
+      ctx.fillStyle = '#450a0a';
+      ctx.fillRect(15, 8, 2, 16);
     });
 
     // Blood splatter decals (floor and walls)

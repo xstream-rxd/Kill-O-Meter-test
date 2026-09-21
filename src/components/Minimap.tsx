@@ -3,20 +3,15 @@ import { GameEngine } from '../engine/gameEngine';
 import { Player, Enemy, PickupItem, LootChest, BossState, SecretArea } from '../types';
 import {
   Maximize2,
-  Minimize2,
   X,
   Compass,
   Crosshair,
-  MapPin,
   Shield,
-  Heart,
   Skull,
-  Zap,
   ZoomIn,
   ZoomOut,
   RotateCcw,
   Sparkles,
-  DoorOpen,
 } from 'lucide-react';
 
 export interface MinimapProps {
@@ -98,6 +93,7 @@ export const Minimap: React.FC<MinimapProps> = ({
         exploredGrid: engine.exploredGrid,
         exitPos: engine.mapData.exitPos,
         exitUnlocked: engine.mapData.exitUnlocked,
+        neutralZone: engine.mapData.neutralZone,
         stageName: engine.mapData.stageName,
         stageNumber: engine.mapData.stageNumber,
         gameTime: engine.gameTime,
@@ -116,6 +112,7 @@ export const Minimap: React.FC<MinimapProps> = ({
       exploredGrid: propExploredGrid,
       exitPos: propExitPos,
       exitUnlocked: Boolean(propExitUnlocked),
+      neutralZone: { minY: 41.5, maxY: 46.5, minX: 18.0, maxX: 30.0 },
       stageName: 'SECTOR 1',
       stageNumber: 1,
       gameTime: performance.now() / 1000,
@@ -148,14 +145,14 @@ export const Minimap: React.FC<MinimapProps> = ({
       radarAngle = (radarAngle + dt * 2.8) % (Math.PI * 2);
 
       const state = getState();
-      const { player, grid, enemies, pickups, chests, boss, isLockdown, secrets, exploredGrid, exitPos, exitUnlocked, stageName, stageNumber, gameTime } = state;
+      const { player, grid, enemies, pickups, chests, boss, isLockdown, secrets, exploredGrid, exitPos, exitUnlocked, neutralZone, stageName, stageNumber, gameTime } = state;
 
       const mapH = grid.length || 32;
       const mapW = grid[0]?.length || 32;
 
-      // Update UI statistics periodically
+      // Update UI statistics periodically (5 Hz for smooth readouts without excess React re-renders)
       statsUpdateTimer += dt;
-      if (statsUpdateTimer > 0.1) {
+      if (statsUpdateTimer > 0.2) {
         statsUpdateTimer = 0;
         let totalFloors = 0;
         let exploredFloors = 0;
@@ -214,6 +211,7 @@ export const Minimap: React.FC<MinimapProps> = ({
           exploredGrid,
           exitPos,
           exitUnlocked,
+          neutralZone,
           gameTime,
           radarAngle,
           isFollowMode: radarFollowPlayer,
@@ -237,6 +235,7 @@ export const Minimap: React.FC<MinimapProps> = ({
           exploredGrid,
           exitPos,
           exitUnlocked,
+          neutralZone,
           gameTime,
           radarAngle,
           isFollowMode: false,
@@ -268,6 +267,7 @@ export const Minimap: React.FC<MinimapProps> = ({
       exploredGrid?: boolean[][];
       exitPos?: { x: number; y: number };
       exitUnlocked: boolean;
+      neutralZone?: { minY: number; maxY: number; minX: number; maxX: number };
       gameTime: number;
       radarAngle: number;
       isFollowMode: boolean;
@@ -291,6 +291,7 @@ export const Minimap: React.FC<MinimapProps> = ({
       exploredGrid,
       exitPos,
       exitUnlocked,
+      neutralZone,
       gameTime,
       radarAngle,
       isFollowMode,
@@ -431,55 +432,59 @@ export const Minimap: React.FC<MinimapProps> = ({
       }
     }
 
-    // 4. Draw Exit Portal (Extraction Point)
-    if (exitPos) {
-      const isExitExplored = exploredGrid ? Boolean(exploredGrid[Math.floor(exitPos.y)]?.[Math.floor(exitPos.x)]) : true;
-      if (isExitExplored || exitUnlocked) {
-        const ex = originX + (exitPos.x + 0.5) * cellSize;
-        const ey = originY + (exitPos.y + 0.5) * cellSize;
+    // 4. Draw Exit Portal (Extraction Point) - ONLY shown when unlocked after level boss is defeated
+    if (exitPos && exitUnlocked) {
+      const ex = originX + (exitPos.x + 0.5) * cellSize;
+      const ey = originY + (exitPos.y + 0.5) * cellSize;
 
-        if (exitUnlocked) {
-          // Unlocked Exit Portal: Pulsating emerald beacon with radar shockwave rings
-          const pulse = (gameTime * 2) % 1;
-          const ringRadius = cellSize * (0.6 + pulse * 1.5);
+      // Unlocked Exit Portal: Pulsating emerald beacon with radar shockwave rings
+      const pulse = (gameTime * 2) % 1;
+      const ringRadius = cellSize * (0.6 + pulse * 1.5);
 
-          // Outer shockwave
-          ctx.strokeStyle = `rgba(34, 197, 94, ${1 - pulse})`;
-          ctx.lineWidth = 1.5;
-          ctx.beginPath();
-          ctx.arc(ex, ey, ringRadius, 0, Math.PI * 2);
-          ctx.stroke();
+      // Outer shockwave
+      ctx.strokeStyle = `rgba(34, 197, 94, ${1 - pulse})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(ex, ey, ringRadius, 0, Math.PI * 2);
+      ctx.stroke();
 
-          // Inner portal core
-          ctx.fillStyle = '#22c55e';
-          ctx.beginPath();
-          ctx.arc(ex, ey, cellSize * 0.55, 0, Math.PI * 2);
-          ctx.fill();
+      // Inner portal core
+      ctx.fillStyle = '#22c55e';
+      ctx.beginPath();
+      ctx.arc(ex, ey, cellSize * 0.55, 0, Math.PI * 2);
+      ctx.fill();
 
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 1.5;
-          ctx.stroke();
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
 
-          // Exit label
-          ctx.fillStyle = '#4ade80';
-          ctx.font = `bold ${Math.max(7, cellSize * 0.65)}px monospace`;
-          ctx.textAlign = 'center';
-          ctx.fillText('EXIT', ex, ey - cellSize * 0.7);
-        } else {
-          // Locked Exit: Amber pad with lock indicator
-          ctx.fillStyle = '#b45309';
-          ctx.fillRect(originX + exitPos.x * cellSize, originY + exitPos.y * cellSize, cellSize, cellSize);
-          ctx.strokeStyle = '#f59e0b';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(originX + exitPos.x * cellSize, originY + exitPos.y * cellSize, cellSize, cellSize);
+      // Exit label
+      ctx.fillStyle = '#4ade80';
+      ctx.font = `bold ${Math.max(7, cellSize * 0.65)}px monospace`;
+      ctx.textAlign = 'center';
+      ctx.fillText('EXIT', ex, ey - cellSize * 0.7);
+    }
 
-          if (isExpanded) {
-            ctx.fillStyle = '#fbbf24';
-            ctx.font = `bold ${Math.max(7, cellSize * 0.5)}px monospace`;
-            ctx.textAlign = 'center';
-            ctx.fillText('LOCKED', ex, ey - cellSize * 0.6);
-          }
-        }
+    // 4b. Draw Safe Staging Bunker Zone
+    if (neutralZone) {
+      const nzx = originX + neutralZone.minX * cellSize;
+      const nzy = originY + neutralZone.minY * cellSize;
+      const nzw = (neutralZone.maxX - neutralZone.minX) * cellSize;
+      const nzh = (neutralZone.maxY - neutralZone.minY) * cellSize;
+
+      ctx.fillStyle = 'rgba(6, 78, 59, 0.18)';
+      ctx.fillRect(nzx, nzy, nzw, nzh);
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.strokeRect(nzx, nzy, nzw, nzh);
+      ctx.setLineDash([]);
+
+      if (isExpanded) {
+        ctx.fillStyle = '#34d399';
+        ctx.font = `bold ${Math.max(7, cellSize * 0.45)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('🛡️ SAFE BUNKER', nzx + nzw / 2, nzy + nzh / 2);
       }
     }
 
@@ -490,6 +495,10 @@ export const Minimap: React.FC<MinimapProps> = ({
       const py = Math.floor(pk.y);
       const isExplored = exploredGrid ? Boolean(exploredGrid[py]?.[px]) : true;
       if (!isExplored) continue;
+
+      // Ensure secret items are completely hidden until secret passage is revealed
+      const isBehindClosedSecret = secrets.some(s => !s.revealed && Math.hypot(pk.x - (s.doorX + 0.5), pk.y - (s.doorY + 0.5)) < 2.5);
+      if (isBehindClosedSecret) continue;
 
       const screenX = originX + pk.x * cellSize;
       const screenY = originY + pk.y * cellSize;
@@ -540,6 +549,10 @@ export const Minimap: React.FC<MinimapProps> = ({
         const isExplored = exploredGrid ? Boolean(exploredGrid[cy]?.[cx]) : true;
         if (!isExplored) continue;
 
+        // Ensure secret chests are completely hidden until secret passage is revealed
+        const isBehindClosedSecret = secrets.some(s => !s.revealed && Math.hypot(c.x - (s.doorX + 0.5), c.y - (s.doorY + 0.5)) < 2.5);
+        if (isBehindClosedSecret) continue;
+
         const screenX = originX + c.x * cellSize;
         const screenY = originY + c.y * cellSize;
         const cr = Math.max(2.5, cellSize * 0.35);
@@ -559,6 +572,30 @@ export const Minimap: React.FC<MinimapProps> = ({
           ctx.fillStyle = '#78350f';
           ctx.fillRect(screenX - cr, screenY - cr * 0.7, cr * 2, cr * 1.4);
         }
+      }
+    }
+
+    // 6.5 Draw Safe Staging Area Perimeter
+    if (neutralZone) {
+      const nzx = originX + neutralZone.minX * cellSize;
+      const nzy = originY + neutralZone.minY * cellSize;
+      const nzw = (neutralZone.maxX - neutralZone.minX) * cellSize;
+      const nzh = (neutralZone.maxY - neutralZone.minY) * cellSize;
+
+      ctx.fillStyle = 'rgba(6, 182, 212, 0.08)';
+      ctx.fillRect(nzx, nzy, nzw, nzh);
+
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.4)';
+      ctx.setLineDash([3, 3]);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(nzx, nzy, nzw, nzh);
+      ctx.setLineDash([]);
+
+      if (isExpanded) {
+        ctx.fillStyle = '#38bdf8';
+        ctx.font = `bold ${Math.max(7, cellSize * 0.45)}px monospace`;
+        ctx.textAlign = 'center';
+        ctx.fillText('🛡️ SAFE STAGING AREA', nzx + nzw / 2, nzy + nzh / 2);
       }
     }
 
@@ -595,6 +632,22 @@ export const Minimap: React.FC<MinimapProps> = ({
       if (isExplored || distToPlayer < 6.0) {
         const screenX = originX + e.x * cellSize;
         const screenY = originY + e.y * cellSize;
+
+        // Draw Enemy Tactical Field of View Cone on Radar
+        const isAlerted = e.state === 'chase' || e.state === 'search' || e.state === 'attack' || e.state === 'pain';
+        const coneHalfAngle = isAlerted ? 0.915 : 0.655; // ~52° or ~37° half angle
+        const coneLen = cellSize * (isAlerted ? 3.8 : 2.6);
+
+        ctx.fillStyle = isAlerted ? 'rgba(239, 68, 68, 0.18)' : 'rgba(245, 158, 11, 0.15)';
+        ctx.beginPath();
+        ctx.moveTo(screenX, screenY);
+        ctx.arc(screenX, screenY, coneLen, e.angle - coneHalfAngle, e.angle + coneHalfAngle);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.strokeStyle = isAlerted ? 'rgba(239, 68, 68, 0.35)' : 'rgba(245, 158, 11, 0.28)';
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
 
         if (e.type === 'boss') {
           // Heavy Cyber Boss: Large crimson hazard marker with warning pulse
@@ -939,8 +992,8 @@ export const Minimap: React.FC<MinimapProps> = ({
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-neutral-400">EXTRACTION GATE:</span>
-                <span className={`font-bold ${stats.exitUnlocked ? 'text-emerald-400 animate-pulse' : 'text-amber-500'}`}>
-                  {stats.exitUnlocked ? 'ONLINE (READY)' : 'LOCKED (CLEAR LEVEL)'}
+                <span className={`font-bold ${stats.exitUnlocked ? 'text-emerald-400 animate-pulse' : 'text-neutral-500'}`}>
+                  {stats.exitUnlocked ? 'ONLINE (READY)' : 'DORMANT (DEFEAT BOSS)'}
                 </span>
               </div>
             </div>

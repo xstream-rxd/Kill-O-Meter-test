@@ -1,4 +1,4 @@
-import { GibParticle, FloorDecal, WallDecal, ShellCasing, SteamParticle } from '../types';
+import { GibParticle, GibType, FloorDecal, WallDecal, ShellCasing, SteamParticle } from '../types';
 import { soundSynth } from './soundSynth';
 
 export interface SparkParticle {
@@ -26,17 +26,33 @@ export class ParticleSystem {
   private nextId = 1;
   private readonly MAX_FLOOR_DECALS = 500;
   private readonly MAX_WALL_DECALS = 300;
-  private readonly MAX_GIBS = 180;
+  private readonly MAX_GIBS = 220;
   private readonly MAX_SPARKS = 250;
   private readonly MAX_STEAM = 120;
   private readonly MAX_CASINGS = 120;
 
   // --- SPAWN VISCERAL GIBS & DISMEMBERED DEBRIS ---
-  public spawnGibExplosion(x: number, y: number, count = 12, isHeavy = false, enemyType = 'grunt') {
-    const types: ('skull' | 'meat' | 'rib' | 'eyeball' | 'blood_drop')[] = [
-      'skull', 'meat', 'rib', 'eyeball', 'blood_drop', 'meat', 'meat', 'rib'
-    ];
-    const actualCount = Math.max(6, Math.min(count, isHeavy ? 20 : 12));
+  public spawnGibExplosion(x: number, y: number, count = 14, isHeavy = false, enemyType = 'grunt') {
+    let pool: GibType[] = [];
+
+    if (enemyType === 'baron') {
+      pool = ['demon_horn', 'demon_horn', 'heart', 'jaw', 'severed_arm', 'severed_leg', 'rib', 'meat', 'skull', 'intestine', 'brain_lobe'];
+    } else if (enemyType === 'plasma_gunner') {
+      pool = ['metal_shard', 'metal_shard', 'severed_arm', 'skull', 'eyeball', 'meat', 'rib', 'brain_lobe', 'blood_drop'];
+    } else if (enemyType === 'vile_spitter') {
+      pool = ['eyeball', 'eyeball', 'intestine', 'severed_leg', 'jaw', 'meat', 'blood_drop', 'brain_lobe', 'rib'];
+    } else if (enemyType === 'boss') {
+      pool = ['demon_horn', 'heart', 'jaw', 'metal_shard', 'skull', 'severed_arm', 'severed_leg', 'brain_lobe', 'intestine', 'rib', 'meat'];
+    } else if (enemyType === 'imp') {
+      pool = ['demon_horn', 'jaw', 'severed_arm', 'heart', 'rib', 'meat', 'eyeball', 'blood_drop', 'skull'];
+    } else if (enemyType === 'scuttler') {
+      pool = ['severed_leg', 'severed_leg', 'eyeball', 'jaw', 'meat', 'blood_drop', 'metal_shard'];
+    } else {
+      // Grunt / standard humanoid demon
+      pool = ['skull', 'brain_lobe', 'severed_arm', 'severed_leg', 'jaw', 'heart', 'rib', 'meat', 'eyeball', 'intestine', 'blood_drop'];
+    }
+
+    const actualCount = Math.max(8, Math.min(count, isHeavy ? 26 : 16));
 
     for (let i = 0; i < actualCount; i++) {
       if (this.gibs.length >= this.MAX_GIBS) {
@@ -44,15 +60,23 @@ export class ParticleSystem {
       }
 
       const angle = Math.random() * Math.PI * 2;
-      const speed = isHeavy ? (1.5 + Math.random() * 3.8) : (1.0 + Math.random() * 2.4);
-      const gibType = types[Math.floor(Math.random() * types.length)];
+      const speed = isHeavy ? (1.6 + Math.random() * 4.2) : (1.0 + Math.random() * 2.8);
+      const gibType = pool[Math.floor(Math.random() * pool.length)];
 
       let color = '#7f1d1d'; // Deep arterial blood
-      if (gibType === 'skull') color = '#f1f5f9';
-      else if (gibType === 'rib') color = '#e2e8f0';
+      if (gibType === 'skull' || gibType === 'rib' || gibType === 'jaw') color = '#e2e8f0';
       else if (gibType === 'eyeball') color = '#f8fafc';
+      else if (gibType === 'demon_horn') color = '#1c1917';
+      else if (gibType === 'metal_shard') color = '#64748b';
+      else if (gibType === 'brain_lobe') color = '#be123c';
       else if (enemyType === 'vile_spitter') color = '#15803d'; // Toxic green gore
       else if (enemyType === 'plasma_gunner') color = '#0284c7'; // Cyan energized gore
+
+      let size = 0.14 + Math.random() * 0.08;
+      if (gibType === 'blood_drop') size = 0.08 + Math.random() * 0.04;
+      else if (gibType === 'skull' || gibType === 'demon_horn') size = 0.22 + Math.random() * 0.08;
+      else if (gibType === 'heart' || gibType === 'brain_lobe') size = 0.18 + Math.random() * 0.06;
+      else if (gibType === 'severed_arm' || gibType === 'severed_leg') size = 0.20 + Math.random() * 0.08;
 
       this.gibs.push({
         id: this.nextId++,
@@ -61,25 +85,27 @@ export class ParticleSystem {
         z: 0.3 + Math.random() * 0.45,
         vx: Math.cos(angle) * speed,
         vy: Math.sin(angle) * speed,
-        vz: 1.8 + Math.random() * 2.8, // High kinetic explosive arc pop
+        vz: 1.8 + Math.random() * 3.2, // High kinetic explosive arc pop
         rot: Math.random() * Math.PI * 2,
-        vRot: (Math.random() - 0.5) * 16,
+        vRot: (Math.random() - 0.5) * 18,
         gibType,
-        size: gibType === 'blood_drop' ? 0.07 : (gibType === 'skull' ? 0.18 : 0.13 + Math.random() * 0.08),
+        size,
         color,
         bounces: 0,
         life: 0,
-        maxLife: 6.0 + Math.random() * 3.0,
+        maxLife: 6.0 + Math.random() * 3.5,
         settled: false,
       });
     }
 
     // Spawn rich blood pool on the floor directly beneath
-    this.addFloorDecal(x, y, 0.65 + Math.random() * 0.35, enemyType === 'vile_spitter' ? 'slime' : 'blood');
+    const decalType = enemyType === 'vile_spitter' ? 'slime' : 'blood';
+    this.addFloorDecal(x, y, 0.75 + Math.random() * 0.40, decalType);
     // Satellite splatters
-    this.addFloorDecal(x + (Math.random() - 0.5) * 0.5, y + (Math.random() - 0.5) * 0.5, 0.35 + Math.random() * 0.25, enemyType === 'vile_spitter' ? 'slime' : 'blood');
+    this.addFloorDecal(x + (Math.random() - 0.5) * 0.6, y + (Math.random() - 0.5) * 0.6, 0.40 + Math.random() * 0.30, decalType);
     if (isHeavy) {
-      this.addFloorDecal(x + (Math.random() - 0.5) * 0.8, y + (Math.random() - 0.5) * 0.8, 0.45 + Math.random() * 0.3, enemyType === 'vile_spitter' ? 'slime' : 'blood');
+      this.addFloorDecal(x + (Math.random() - 0.5) * 0.9, y + (Math.random() - 0.5) * 0.9, 0.50 + Math.random() * 0.35, decalType);
+      this.addFloorDecal(x + (Math.random() - 0.5) * 1.2, y + (Math.random() - 0.5) * 1.2, 0.35 + Math.random() * 0.25, decalType);
     }
   }
 

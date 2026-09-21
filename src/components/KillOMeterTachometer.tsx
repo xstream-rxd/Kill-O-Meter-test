@@ -1,9 +1,10 @@
 import React, { useEffect, useRef } from 'react';
-import { Flame, Skull, Zap, AlertTriangle, Radio, Activity, Thermometer } from 'lucide-react';
+import { Flame, Zap, AlertTriangle } from 'lucide-react';
 
 interface KillOMeterTachometerProps {
   killOMeter: number; // 0 to 100
   levelKills?: number;
+  requiredKills?: number;
   totalLevelEnemies?: number;
   isLockdown?: boolean;
   isBerserk?: boolean;
@@ -28,6 +29,7 @@ interface HeatEmber {
 export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
   killOMeter,
   levelKills = 0,
+  requiredKills,
   totalLevelEnemies = 10,
   isLockdown = false,
   isBerserk = false,
@@ -515,18 +517,19 @@ export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
       // Primary Status Text (Top line inside screen)
       ctx.font = 'bold 10.5px monospace';
       ctx.textAlign = 'center';
+      const targetKills = requiredKills ?? totalLevelEnemies;
       if (clampedPct >= 100 || isLockdown) {
         // Flashing Lockdown Warning
         const isFlash = Math.floor(t * 8) % 2 === 0;
         ctx.fillStyle = isFlash ? '#ef4444' : '#fbbf24';
-        ctx.fillText('⚠ TITAN LOCKDOWN ⚠', cx, mfdY + 13);
+        ctx.fillText('⚠ 1-ON-1 BOSS DUEL ⚠', cx, mfdY + 13);
       } else {
-        const remaining = Math.max(0, totalLevelEnemies - levelKills);
+        const remaining = Math.max(0, targetKills - levelKills);
         ctx.fillStyle = remaining === 0 ? '#10b981' : heatLevel >= 0.75 ? '#f87171' : heatLevel >= 0.4 ? '#fbbf24' : '#38bdf8';
         ctx.fillText(
           remaining === 0
-            ? 'ALL DEMONS SLAIN'
-            : `HOSTILES: ${remaining} ACTIVE`,
+            ? '⚡ BOSS SUMMONED ⚡'
+            : `REMAINING: ${remaining} TO BOSS`,
           cx,
           mfdY + 13
         );
@@ -536,12 +539,12 @@ export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
       ctx.font = 'bold 10px monospace';
       if (clampedPct >= 100 || isLockdown) {
         ctx.fillStyle = '#ef4444';
-        ctx.fillText('MAX REDLINE ENGAGED', cx, mfdY + 27);
+        ctx.fillText('MINIONS BANISHED // 1v1', cx, mfdY + 27);
       } else {
         const thermalStatus = heatLevel >= 0.85 ? 'OVERHEAT!' : heatLevel >= 0.5 ? 'HEATING UP' : 'STABLE';
         ctx.fillStyle = heatLevel >= 0.85 ? '#f87171' : heatLevel >= 0.5 ? '#fcd34d' : '#e2e8f0';
         ctx.fillText(
-          `${levelKills}/${totalLevelEnemies} (${Math.round(clampedPct)}%) ${thermalStatus}`,
+          `${levelKills}/${targetKills} (${Math.round(clampedPct)}%) ${thermalStatus}`,
           cx,
           mfdY + 27
         );
@@ -711,7 +714,7 @@ export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
         cancelAnimationFrame(animFrameRef.current);
       }
     };
-  }, [killOMeter, levelKills, totalLevelEnemies, isLockdown, isBerserk]);
+  }, [killOMeter, levelKills, requiredKills, totalLevelEnemies, isLockdown, isBerserk]);
 
   const isMax = killOMeter >= 100 || isLockdown;
   const isHigh = killOMeter >= 75;
@@ -758,7 +761,7 @@ export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
               : 'bg-cyan-950/90 text-cyan-300 border border-cyan-500/50'
           }`}
         >
-          {isMax ? 'LOCKDOWN' : `${Math.round(killOMeter)}%`}
+          {isMax ? '1v1 DUEL' : `${Math.round(killOMeter)}%`}
         </span>
       </div>
 
@@ -776,7 +779,7 @@ export const KillOMeterTachometer: React.FC<KillOMeterTachometerProps> = ({
           <div className="absolute top-1 inset-x-0 flex justify-center pointer-events-none">
             <span className="px-2 py-0.5 bg-red-950/95 border border-red-400 text-red-200 font-pixel text-[7px] sm:text-[8px] font-black tracking-wider rounded shadow-lg flex items-center gap-1 animate-bounce">
               <AlertTriangle className="w-2.5 h-2.5 text-amber-300" />
-              LOCKDOWN ENGAGED
+              1-ON-1 BOSS DUEL
             </span>
           </div>
         )}
